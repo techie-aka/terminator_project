@@ -1,4 +1,3 @@
-
 #ifndef PTYSESSION_H
 #define PTYSESSION_H
 
@@ -9,9 +8,6 @@ class PtySession {
 private:
     int masterFd;
     pid_t processId;
-    std::string rcFilePath;
-
-    bool createShellConfig();
 
 public:
     PtySession();

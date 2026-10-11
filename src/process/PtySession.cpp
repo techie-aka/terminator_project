@@ -1,4 +1,3 @@
-
 #include "process/PtySession.h"
 
 #include <cerrno>
@@ -14,52 +13,8 @@ PtySession::PtySession()
     : masterFd(-1), processId(-1) {
 }
 
-bool PtySession::createShellConfig() {
-    char path[] = "/tmp/terminator-bashrc-XXXXXX";
-
-    const int fd = mkstemp(path);
-
-    if (fd == -1) {
-        return false;
-    }
-
-    rcFilePath = path;
-
-    // Preserve the user's Bash configuration and define our newtab command.
-    const std::string config =
-        "if [ -f \"$HOME/.bashrc\" ]; then source \"$HOME/.bashrc\"; fi\n"
-        "function newtab() { printf '\\033]777;newtab\\007'; }\n"
-        "export TERM=xterm-256color\n";
-
-    std::size_t written = 0;
-
-    while (written < config.size()) {
-        const ssize_t count = write(
-            fd, config.data() + written, config.size() - written
-        );
-
-        if (count > 0) {
-            written += static_cast<std::size_t>(count);
-        } else if (count < 0 && errno == EINTR) {
-            continue;
-        } else {
-            close(fd);
-            unlink(rcFilePath.c_str());
-            rcFilePath.clear();
-            return false;
-        }
-    }
-
-    close(fd);
-    return true;
-}
-
 bool PtySession::start() {
     if (processId > 0 || masterFd != -1) {
-        return false;
-    }
-
-    if (!createShellConfig()) {
         return false;
     }
 
@@ -77,21 +32,20 @@ bool PtySession::start() {
             masterFd = -1;
         }
 
-        unlink(rcFilePath.c_str());
-        rcFilePath.clear();
         return false;
     }
 
     if (processId == 0) {
-        // Child process: replace the child with interactive Bash.
+        // Child process: launch our custom shell instead of Bash.
         setenv("TERM", "xterm-256color", 1);
 
         execl(
-            "/bin/bash", "bash",
-            "--noprofile", "--rcfile", rcFilePath.c_str(), "-i",
+            "./build/terminator-shell",
+            "terminator-shell",
             static_cast<char*>(nullptr)
         );
 
+        // Reached only if exec fails.
         _exit(127);
     }
 
@@ -104,8 +58,6 @@ bool PtySession::start() {
         close(masterFd);
         masterFd = -1;
         processId = -1;
-        unlink(rcFilePath.c_str());
-        rcFilePath.clear();
         return false;
     }
 
@@ -121,7 +73,9 @@ bool PtySession::writeInput(const std::string& input) {
 
     while (written < input.size()) {
         const ssize_t count = write(
-            masterFd, input.data() + written, input.size() - written
+            masterFd,
+            input.data() + written,
+            input.size() - written
         );
 
         if (count > 0) {
@@ -186,7 +140,8 @@ PtySession::~PtySession() {
         for (int attempt = 0; attempt < 20; ++attempt) {
             const pid_t result = waitpid(processId, &status, WNOHANG);
 
-            if (result == processId || (result == -1 && errno == ECHILD)) {
+            if (result == processId ||
+                (result == -1 && errno == ECHILD)) {
                 exited = true;
                 break;
             }
@@ -204,7 +159,8 @@ PtySession::~PtySession() {
                 kill(-processId, SIGKILL);
             }
 
-            while (waitpid(processId, &status, 0) == -1 && errno == EINTR) {
+            while (waitpid(processId, &status, 0) == -1 &&
+                   errno == EINTR) {
             }
         }
 
@@ -214,9 +170,5 @@ PtySession::~PtySession() {
     if (masterFd != -1) {
         close(masterFd);
         masterFd = -1;
-    }
-
-    if (!rcFilePath.empty()) {
-        unlink(rcFilePath.c_str());
     }
 }

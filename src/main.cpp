@@ -175,26 +175,38 @@ int main() {
         return true;
     };
 
-    // Close the active tab and release its terminal resources.
-    auto closeTab = [&]() -> bool {
+    // Close a particular tab and keep the active-tab index valid.
+    auto closeTabAt = [&](int tabIndex) -> bool {
+        if (tabIndex < 0 ||
+            tabIndex >= static_cast<int>(terminals.size())) {
+            return !terminals.empty();
+        }
+
+        terminals.erase(terminals.begin() + tabIndex);
+
+        // No tabs remain, so the application can exit.
         if (terminals.empty()) {
             return false;
         }
 
-        terminals.erase(terminals.begin() + activeTab);
-
-        // Closing the final tab exits the application.
-        if (terminals.empty()) {
-            return false;
+        if (tabIndex < activeTab) {
+            --activeTab;
+        } else if (tabIndex == activeTab) {
+            activeTab = min(
+                activeTab,
+                static_cast<int>(terminals.size()) - 1
+            );
         }
-
-        // Select a valid remaining tab.
-        activeTab = min(activeTab, static_cast<int>(terminals.size()) - 1);
 
         draggingScrollbar = false;
         cursorVisible = true;
 
         return true;
+    };
+
+    // Close whichever tab is currently active.
+    auto closeTab = [&]() -> bool {
+        return closeTabAt(activeTab);
     };
 
     if (!createTab()) {
@@ -441,41 +453,62 @@ int main() {
 
         // Collect output from every tab, including inactive tabs.
         bool createRequestedTab = false;
+        vector<int> terminatedTabs;
 
         if (ready > 0) {
-            for (auto& terminal : terminals) {
-                const int fd = terminal->getSession().getFileDescriptor();
+            for (int i = 0; i < static_cast<int>(terminals.size()); ++i) {
+                Terminal& terminal = *terminals[i];
+                const int fd = terminal.getSession().getFileDescriptor();
 
                 if (fd < 0 || fd >= FD_SETSIZE || !FD_ISSET(fd, &readSet)) {
                     continue;
                 }
 
                 const int oldTotalLines = static_cast<int>(
-                    terminal->getBuffer().getLines().size()
+                    terminal.getBuffer().getLines().size()
                 );
 
                 const bool wasAtBottom =
-                    terminal->getFirstVisibleLine() >=
+                    terminal.getFirstVisibleLine() >=
                     max(0, oldTotalLines - getVisibleLines());
 
-                if (terminal->receiveOutput()) {
+                // Read pending output. This may detect that the shell has exited.
+                if (terminal.receiveOutput()) {
                     createRequestedTab = true;
                 }
 
+                // PtySession::readOutput() sets the descriptor to -1 on PTY closure.
+                if (terminal.getSession().getFileDescriptor() == -1) {
+                    terminatedTabs.push_back(i);
+                    redraw = true;
+                    continue;
+                }
+
                 if (wasAtBottom) {
-                    scrollToBottom(*terminal);
+                    scrollToBottom(terminal);
                 }
 
                 redraw = true;
             }
         }
 
-        // Both the keyboard shortcut and the shell's newtab command
-        // use the same tab-creation function.
+        // Remove terminated tabs in reverse order to preserve the remaining indices.
+        for (auto it = terminatedTabs.rbegin();
+            it != terminatedTabs.rend();
+            ++it) {
+            closeTabAt(*it);
+        }
+
+        // Preserve tab creation requests received from shell output.
         if (createRequestedTab) {
             if (createTab()) {
                 redraw = true;
             }
+        }
+
+        // If every shell has exited, close the application.
+        if (terminals.empty()) {
+            return 0;
         }
 
         if (redraw) {
