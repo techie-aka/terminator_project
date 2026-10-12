@@ -6,18 +6,19 @@
 #include <vector>
 
 class History;
+class JobManager;
 
 class Builtins {
 public:
     using LineExecutor = std::function<int(const std::string&)>;
 
-    // Returns true when a built-in handled the command.
     bool execute(
         const std::vector<std::string>& arguments,
         int& exitStatus,
         bool& shouldExit,
         const LineExecutor& executeLine,
-        History& history
+        History& history,
+        JobManager& jobs
     ) const;
 };
 

@@ -1,5 +1,6 @@
 #include "shell/Builtins.h"
 #include "shell/History.h"
+#include "shell/JobManager.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -10,18 +11,108 @@
 #include <unistd.h>
 #include <vector>
 
+#include <limits>
+#include <stdexcept>
+
 bool Builtins::execute(
     const std::vector<std::string>& arguments,
     int& exitStatus,
     bool& shouldExit,
     const LineExecutor& executeLine,
-    History& history
+    History& history,
+    JobManager& jobs
 ) const {
     if (arguments.empty()) {
         return false;
     }
 
     const std::string& command = arguments[0];
+
+    // Display the current shell's background jobs.
+    if (command == "jobs") {
+        if (arguments.size() != 1) {
+            std::cerr << "terminator: jobs: this command takes no arguments\n";
+            exitStatus = 2;
+            return true;
+        }
+
+        jobs.update();
+        jobs.print(std::cout);
+
+        exitStatus = 0;
+        return true;
+    }
+
+    // Resume or foreground a tracked job.
+    if (command == "fg" || command == "bg") {
+        if (arguments.size() > 2) {
+            std::cerr << "terminator: " << command
+                    << ": expected at most one job ID\n";
+            exitStatus = 2;
+            return true;
+        }
+
+        // Without an argument, select the most recent active job.
+        int jobId = 0;
+
+        if (arguments.size() == 2) {
+            std::string idText = arguments[1];
+
+            // Support both "1" and "%1".
+            if (!idText.empty() && idText[0] == '%') {
+                idText.erase(0, 1);
+            }
+
+            try {
+                std::size_t parsedLength = 0;
+                const long parsedId = std::stol(idText, &parsedLength);
+
+                if (parsedLength != idText.size() ||
+                    parsedId <= 0 ||
+                    parsedId > std::numeric_limits<int>::max()) {
+                    throw std::invalid_argument("invalid job ID");
+                }
+
+                jobId = static_cast<int>(parsedId);
+            } catch (const std::exception&) {
+                std::cerr << "terminator: " << command
+                        << ": invalid job ID\n";
+                exitStatus = 2;
+                return true;
+            }
+        } else {
+            jobId = jobs.latestJobId();
+        }
+
+        if (jobId == 0) {
+            std::cerr << "terminator: " << command
+                    << ": no current job\n";
+            exitStatus = 1;
+            return true;
+        }
+
+        if (command == "fg") {
+            if (!jobs.foreground(jobId, exitStatus)) {
+                std::cerr << "terminator: fg: "
+                        << "cannot foreground job %" << jobId << '\n';
+                exitStatus = 1;
+            }
+
+            return true;
+        }
+
+        if (!jobs.background(jobId)) {
+            std::cerr << "terminator: bg: "
+                    << "cannot resume job %" << jobId << '\n';
+            exitStatus = 1;
+            return true;
+        }
+
+        jobs.update();
+        std::cout << '[' << jobId << "] Running\n";
+        exitStatus = 0;
+        return true;
+    }
 
     // Exit the current shell process.
     if (command == "exit") {

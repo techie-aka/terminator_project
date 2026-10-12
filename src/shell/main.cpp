@@ -2,6 +2,7 @@
 #include "shell/CommandExecutor.h"
 #include "shell/CommandParser.h"
 #include "shell/History.h"
+#include "shell/JobManager.h"
 
 #include <csignal>
 #include <functional>
@@ -128,13 +129,19 @@ bool readCommandLine(
 }
 
 int main() {
-    // Allow the shell to restore foreground terminal ownership.
+    // The interactive shell must survive terminal-generated signals.
+    // External children restore default signal handling in CommandExecutor.
+    std::signal(SIGINT, SIG_IGN);
+    std::signal(SIGQUIT, SIG_IGN);
+    std::signal(SIGTSTP, SIG_IGN);
+    std::signal(SIGTTIN, SIG_IGN);
     std::signal(SIGTTOU, SIG_IGN);
 
     CommandParser parser;
     CommandExecutor executor;
     Builtins builtins;
     History history;
+    JobManager jobs;
 
     if (!history.isReady()) {
         std::cerr << "terminator: shared history is unavailable\n";
@@ -148,31 +155,84 @@ int main() {
     std::function<int(const std::string&)> executeLine;
 
     executeLine = [&](const std::string& commandLine) -> int {
+        std::string commandToParse = commandLine;
+
+        // Recognize a trailing '&' as background execution.
+        // Quote-aware parsing will be added in Task 3.
+        const std::size_t lastCharacter =
+            commandToParse.find_last_not_of(" \t\r");
+
+        bool background = false;
+
+        if (lastCharacter != std::string::npos &&
+            commandToParse[lastCharacter] == '&') {
+            background = true;
+            commandToParse.erase(lastCharacter, 1);
+        }
+
         const std::vector<std::string> arguments =
-            parser.parse(commandLine, lastExitStatus);
+            parser.parse(commandToParse, lastExitStatus);
 
         // Do not change $? for an empty line.
         if (arguments.empty()) {
             return lastExitStatus;
         }
 
-        // Preserve the Task 1 new-tab feature.
+        jobs.update();
+
+        // Preserve the existing new-tab feature.
         if (arguments[0] == "newtab" && arguments.size() == 1) {
             std::cout << "\033]777;newtab\a" << std::flush;
             lastExitStatus = 0;
             return lastExitStatus;
         }
 
+        // Built-ins execute in the current shell process.
         if (builtins.execute(
                 arguments,
                 lastExitStatus,
                 shouldExit,
                 executeLine,
-                history)) {
+                history,
+                jobs)) {
             return lastExitStatus;
         }
 
-        lastExitStatus = executor.execute(arguments);
+        pid_t startedProcess = -1;
+        pid_t startedProcessGroup = -1;
+        bool processStopped = false;
+
+        lastExitStatus = executor.execute(
+            arguments,
+            background,
+            &startedProcess,
+            &startedProcessGroup,
+            &processStopped
+        );
+
+        // Register background jobs and foreground jobs stopped with Ctrl+Z.
+        if (startedProcess > 0 && (background || processStopped)) {
+            const JobState initialState = background
+                ? JobState::Running
+                : JobState::Stopped;
+
+            const int jobId = jobs.addJob(
+                startedProcess,
+                startedProcessGroup,
+                commandLine,
+                initialState
+            );
+
+            if (background) {
+                std::cout << '[' << jobId << "] "
+                        << startedProcess << '\n' << std::flush;
+
+                lastExitStatus = 0;
+            } else {
+                std::cout << '[' << jobId << "] Stopped "
+                        << commandLine << '\n' << std::flush;
+            }
+        }
         return lastExitStatus;
     };
 

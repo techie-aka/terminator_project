@@ -100,8 +100,13 @@ string Input::translateKeyPress(XKeyEvent& keyEvent) {
             return "\x04";
         }
 
+        if (keySymbol == XK_z || keySymbol == XK_Z) {
+            return "\x1a";
+        }
+
         // Ctrl+Shift+T is handled by the application controller.
-        if (keySymbol == XK_t || keySymbol == XK_T) {
+        if (keyEvent.state & ShiftMask &&
+            (keySymbol == XK_t || keySymbol == XK_T)) {
             return "";
         }
     }
