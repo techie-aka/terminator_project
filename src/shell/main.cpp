@@ -3,6 +3,7 @@
 #include "shell/CommandParser.h"
 #include "shell/History.h"
 #include "shell/JobManager.h"
+#include "shell/PipelineExecutor.h"
 
 #include <csignal>
 #include <functional>
@@ -385,6 +386,7 @@ int main() {
     Builtins builtins;
     History history;
     JobManager jobs;
+    PipelineExecutor pipelineExecutor;
 
     if (!history.isReady()) {
         std::cerr << "terminator: shared history is unavailable\n";
@@ -448,7 +450,7 @@ int main() {
 
             // Execute the pipeline and preserve its exit status for later $?
             // expansions.
-            lastExitStatus = executor.executePipeline(pipelineCommands);
+            lastExitStatus = pipelineExecutor.executePipeline(pipelineCommands);
 
             return lastExitStatus;
         }

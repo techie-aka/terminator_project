@@ -15,10 +15,6 @@ public:
         pid_t* startedProcessGroup = nullptr,
         bool* processStopped = nullptr
     ) const;
-
-    int executePipeline(
-        const std::vector<std::vector<std::string>>& commands
-    ) const;
 };
 
 #endif
