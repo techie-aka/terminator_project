@@ -3,13 +3,15 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+
 #include <cstring>
+#include <vector>
+\
 #include <fcntl.h>
 #include <iostream>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <vector>
 
 int CommandExecutor::execute(
     const std::vector<std::string>& arguments,
@@ -213,6 +215,143 @@ int CommandExecutor::execute(
 
     if (WIFSIGNALED(status)) {
         return 128 + WTERMSIG(status);
+    }
+
+    return 1;
+}
+
+int CommandExecutor::executePipeline(
+    const std::vector<std::vector<std::string>>& commands
+) const {
+    if (commands.empty()) {
+        return 0;
+    }
+
+    // Reject empty stages, such as "ls || wc".
+    for (const auto& command : commands) {
+        if (command.empty()) {
+            std::cerr << "terminator: invalid null command in pipeline\n";
+            return 2;
+        }
+    }
+
+    // This checkpoint implements the two-command pipeline.
+    if (commands.size() != 2) {
+        std::cerr << "terminator: this checkpoint supports two commands per pipeline\n";
+        return 2;
+    }
+
+    int pipeFd[2];
+
+    if (pipe(pipeFd) == -1) {
+        std::cerr << "terminator: pipe: "
+                  << std::strerror(errno) << '\n';
+        return 1;
+    }
+
+    pid_t children[2] = {-1, -1};
+
+    for (int i = 0; i < 2; ++i) {
+        children[i] = fork();
+
+        if (children[i] == -1) {
+            std::cerr << "terminator: fork: "
+                      << std::strerror(errno) << '\n';
+
+            // Close the pipe and stop any child already created.
+            close(pipeFd[0]);
+            close(pipeFd[1]);
+
+            for (pid_t child : children) {
+                if (child > 0) {
+                    kill(child, SIGTERM);
+                }
+            }
+
+            for (pid_t child : children) {
+                if (child > 0) {
+                    while (waitpid(child, nullptr, 0) == -1 &&
+                           errno == EINTR) {
+                    }
+                }
+            }
+
+            return 1;
+        }
+
+        if (children[i] == 0) {
+            if (i == 0) {
+                // First command writes to the pipe.
+                dup2(pipeFd[1], STDOUT_FILENO);
+            } else {
+                // Second command reads from the pipe.
+                dup2(pipeFd[0], STDIN_FILENO);
+            }
+
+            close(pipeFd[0]);
+            close(pipeFd[1]);
+
+            std::vector<char*> argv;
+
+            for (const std::string& argument : commands[i]) {
+                argv.push_back(
+                    const_cast<char*>(argument.c_str())
+                );
+            }
+
+            argv.push_back(nullptr);
+
+            execvp(argv[0], argv.data());
+
+            const int executionError = errno;
+
+            if (executionError == ENOENT ||
+                executionError == ENOTDIR) {
+                dprintf(
+                    STDERR_FILENO,
+                    "terminator: %s: command not found\n",
+                    commands[i][0].c_str()
+                );
+                _exit(127);
+            }
+
+            dprintf(
+                STDERR_FILENO,
+                "terminator: %s: %s\n",
+                commands[i][0].c_str(),
+                std::strerror(executionError)
+            );
+
+            _exit(126);
+        }
+    }
+
+    // The parent must close both ends or the reader may never see EOF.
+    close(pipeFd[0]);
+    close(pipeFd[1]);
+
+    int statuses[2] = {0, 0};
+
+    // Wait for both children, even if one fails.
+    for (int i = 0; i < 2; ++i) {
+        while (waitpid(children[i], &statuses[i], 0) == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            std::cerr << "terminator: waitpid: "
+                      << std::strerror(errno) << '\n';
+            return 1;
+        }
+    }
+
+    // A pipeline's status is the status of its final command.
+    if (WIFEXITED(statuses[1])) {
+        return WEXITSTATUS(statuses[1]);
+    }
+
+    if (WIFSIGNALED(statuses[1])) {
+        return 128 + WTERMSIG(statuses[1]);
     }
 
     return 1;

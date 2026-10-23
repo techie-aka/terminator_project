@@ -10,6 +10,10 @@ public:
         const std::string& input,
         int lastExitStatus
     ) const;
+
+    std::vector<std::string> splitPipeline(
+        const std::string& input
+    ) const;
 };
 
 #endif

@@ -170,6 +170,46 @@ int main() {
             commandToParse.erase(lastCharacter, 1);
         }
 
+        // First determine whether the input contains an outer pipeline.
+        const std::vector<std::string> pipelineStages =
+            parser.splitPipeline(commandToParse);
+
+        if (pipelineStages.size() > 1) {
+            // Background pipelines will be handled during later job-control work.
+            if (background) {
+                std::cerr
+                    << "terminator: background pipelines are not supported yet\n";
+
+                lastExitStatus = 2;
+                return lastExitStatus;
+            }
+
+            std::vector<std::vector<std::string>> pipelineCommands;
+
+            // Parse every stage using the existing quote-aware tokenizer.
+            for (const std::string& stage : pipelineStages) {
+                const std::vector<std::string> stageArguments =
+                    parser.parse(stage, lastExitStatus);
+
+                // A leading, trailing or consecutive pipe creates an empty stage.
+                if (stageArguments.empty()) {
+                    std::cerr
+                        << "terminator: invalid empty pipeline stage\n";
+
+                    lastExitStatus = 2;
+                    return lastExitStatus;
+                }
+
+                pipelineCommands.push_back(stageArguments);
+            }
+
+            // Execute the pipeline and preserve its exit status for later $?
+            // expansions.
+            lastExitStatus = executor.executePipeline(pipelineCommands);
+
+            return lastExitStatus;
+        }
+
         const std::vector<std::string> arguments =
             parser.parse(commandToParse, lastExitStatus);
 
