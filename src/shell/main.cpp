@@ -5,6 +5,7 @@
 #include "shell/JobManager.h"
 #include "shell/PipelineExecutor.h"
 #include "shell/CommandSubstitution.h"
+#include "shell/Redirection.h"
 
 #include <csignal>
 #include <functional>
@@ -402,7 +403,8 @@ int main() {
     std::function<int(const std::string&)> executeLine;
 
     executeLine = [&](const std::string& commandLine) -> int {
-        
+        // First expand command substitutions. A pipe produced inside a
+        // substitution must not accidentally become an outer pipeline.
         std::string commandToParse;
         std::string substitutionError;
 
@@ -415,10 +417,10 @@ int main() {
             lastExitStatus = 2;
             return lastExitStatus;
         }
-        // Recognize a trailing '&' as background execution.
-        // Quote-aware parsing will be added in Task 3.
+
+        // Preserve the existing trailing '&' background-command behavior.
         const std::size_t lastCharacter =
-            commandToParse.find_last_not_of(" \t\r");
+            commandToParse.find_last_not_of(" \t\r\n");
 
         bool background = false;
 
@@ -428,12 +430,12 @@ int main() {
             commandToParse.erase(lastCharacter, 1);
         }
 
-        // First determine whether the input contains an outer pipeline.
+        // Split the command into pipeline stages before parsing the
+        // redirection belonging to each individual stage.
         const std::vector<std::string> pipelineStages =
             parser.splitPipeline(commandToParse);
 
         if (pipelineStages.size() > 1) {
-            // Background pipelines will be handled during later job-control work.
             if (background) {
                 std::cerr
                     << "terminator: background pipelines are not supported yet\n";
@@ -442,15 +444,23 @@ int main() {
                 return lastExitStatus;
             }
 
-            std::vector<std::vector<std::string>> pipelineCommands;
+            std::vector<ParsedCommand> pipelineCommands;
 
-            // Parse every stage using the existing quote-aware tokenizer.
             for (const std::string& stage : pipelineStages) {
-                const std::vector<std::string> stageArguments =
-                    parser.parse(stage, lastExitStatus);
+                ParsedCommand parsedStage;
+                std::string parseError;
 
-                // A leading, trailing or consecutive pipe creates an empty stage.
-                if (stageArguments.empty()) {
+                if (!parser.parseCommand(
+                        stage,
+                        lastExitStatus,
+                        parsedStage,
+                        parseError)) {
+                    std::cerr << "terminator: " << parseError << '\n';
+                    lastExitStatus = 2;
+                    return lastExitStatus;
+                }
+
+                if (parsedStage.arguments.empty()) {
                     std::cerr
                         << "terminator: invalid empty pipeline stage\n";
 
@@ -458,25 +468,67 @@ int main() {
                     return lastExitStatus;
                 }
 
-                pipelineCommands.push_back(stageArguments);
+                pipelineCommands.push_back(parsedStage);
             }
 
-            // Execute the pipeline and preserve its exit status for later $?
-            // expansions.
-            lastExitStatus = pipelineExecutor.executePipeline(pipelineCommands);
+            // Each stage carries its own input/output redirection metadata.
+            lastExitStatus =
+                pipelineExecutor.executePipeline(pipelineCommands);
 
             return lastExitStatus;
         }
 
-        const std::vector<std::string> arguments =
-            parser.parse(commandToParse, lastExitStatus);
+        // Parse an ordinary command and extract optional redirections.
+        ParsedCommand parsedCommand;
+        std::string parseError;
 
-        // Do not change $? for an empty line.
+        if (!parser.parseCommand(
+                commandToParse,
+                lastExitStatus,
+                parsedCommand,
+                parseError)) {
+            std::cerr << "terminator: " << parseError << '\n';
+            lastExitStatus = 2;
+            return lastExitStatus;
+        }
+
+        const std::vector<std::string>& arguments =
+            parsedCommand.arguments;
+
+        // Empty input must not change the previous exit status.
         if (arguments.empty()) {
             return lastExitStatus;
         }
 
         jobs.update();
+
+        const bool hasRedirection =
+            parsedCommand.redirection.hasInput ||
+            parsedCommand.redirection.hasOutput;
+
+        // Built-ins execute in the shell process. This iteration supports
+        // redirection only for external commands and pipeline stages.
+        const std::string& commandName = arguments[0];
+
+        const bool isShellBuiltin =
+            commandName == "cd" ||
+            commandName == "exit" ||
+            commandName == "history" ||
+            commandName == "source" ||
+            commandName == "jobs" ||
+            commandName == "fg" ||
+            commandName == "bg" ||
+            commandName == "multiWatch" ||
+            commandName == "newtab";
+
+        if (hasRedirection && isShellBuiltin) {
+            std::cerr
+                << "terminator: redirection for shell built-ins "
+                << "is not supported yet\n";
+
+            lastExitStatus = 2;
+            return lastExitStatus;
+        }
 
         // Preserve the existing new-tab feature.
         if (arguments[0] == "newtab" && arguments.size() == 1) {
@@ -500,15 +552,18 @@ int main() {
         pid_t startedProcessGroup = -1;
         bool processStopped = false;
 
+        // Pass the parsed redirection information to the external-command
+        // executor. The executor applies it in the child before execvp().
         lastExitStatus = executor.execute(
             arguments,
             background,
             &startedProcess,
             &startedProcessGroup,
-            &processStopped
+            &processStopped,
+            &parsedCommand.redirection
         );
 
-        // Register background jobs and foreground jobs stopped with Ctrl+Z.
+        // Preserve existing background job and stopped-job registration.
         if (startedProcess > 0 && (background || processStopped)) {
             const JobState initialState = background
                 ? JobState::Running
@@ -531,6 +586,7 @@ int main() {
                         << commandLine << '\n' << std::flush;
             }
         }
+
         return lastExitStatus;
     };
 

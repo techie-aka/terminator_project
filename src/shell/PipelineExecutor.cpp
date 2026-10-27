@@ -1,4 +1,5 @@
 #include "shell/PipelineExecutor.h"
+#include "shell/Redirection.h"
 
 #include <array>
 #include <cerrno>
@@ -12,11 +13,10 @@
 #include <unistd.h>
 
 int PipelineExecutor::executePipeline(
-    const std::vector<std::vector<std::string>>& commands
+    const std::vector<ParsedCommand>& commands
 ) const {
     const std::size_t commandCount = commands.size();
 
-    // A pipeline requires at least two commands.
     if (commandCount < 2) {
         std::fprintf(
             stderr,
@@ -25,10 +25,10 @@ int PipelineExecutor::executePipeline(
         return 2;
     }
 
-    // Reject empty stages before creating any OS resources.
-    // This handles leading, trailing and consecutive pipes.
+    // Reject empty commands before acquiring any file descriptors.
     for (const auto& command : commands) {
-        if (command.empty() || command[0].empty()) {
+        if (command.arguments.empty() ||
+            command.arguments[0].empty()) {
             std::fprintf(
                 stderr,
                 "terminator: invalid empty pipeline stage\n"
@@ -37,11 +37,10 @@ int PipelineExecutor::executePipeline(
         }
     }
 
-    // N commands need N - 1 pipes. Each pipe contains its read and write ends.
+    // N commands require N - 1 pipes.
     std::vector<std::array<int, 2>> pipes;
     pipes.reserve(commandCount - 1);
 
-    // Close every pipe descriptor currently held by this process.
     auto closeAllPipes = [&pipes]() {
         for (const auto& pipeFd : pipes) {
             close(pipeFd[0]);
@@ -49,7 +48,7 @@ int PipelineExecutor::executePipeline(
         }
     };
 
-    // Create all the pipes before launching the commands.
+    // Create every pipe before launching the stages.
     for (std::size_t i = 0; i + 1 < commandCount; ++i) {
         int pipeFd[2];
 
@@ -62,12 +61,10 @@ int PipelineExecutor::executePipeline(
         pipes.push_back({pipeFd[0], pipeFd[1]});
     }
 
-    // Retain each child PID so we can wait for the exact processes
-    // created for this pipeline.
     std::vector<pid_t> childPids;
     childPids.reserve(commandCount);
 
-    // Launch every command before waiting, so the stages can run concurrently.
+    // Start all stages before waiting for any individual child.
     for (std::size_t i = 0; i < commandCount; ++i) {
         const pid_t pid = fork();
 
@@ -75,12 +72,12 @@ int PipelineExecutor::executePipeline(
             const int forkError = errno;
             std::perror("fork");
 
-            // Release the parent's copies of the pipe descriptors.
             closeAllPipes();
 
-            // Stop and reap every child already started.
+            // Terminate children already launched.
             for (pid_t childPid : childPids) {
-                if (kill(childPid, SIGTERM) == -1 && errno != ESRCH) {
+                if (kill(childPid, SIGTERM) == -1 &&
+                    errno != ESRCH) {
                     std::perror("kill");
                 }
             }
@@ -96,6 +93,7 @@ int PipelineExecutor::executePipeline(
                     if (errno != ECHILD) {
                         std::perror("waitpid");
                     }
+
                     break;
                 }
             }
@@ -105,15 +103,14 @@ int PipelineExecutor::executePipeline(
         }
 
         if (pid == 0) {
-            // Restore ordinary command signal behavior. Full pipeline process
-            // groups and terminal handoff belong to the later job-control step.
+            // Restore normal signal behavior in external commands.
             std::signal(SIGINT, SIG_DFL);
             std::signal(SIGQUIT, SIG_DFL);
             std::signal(SIGTSTP, SIG_DFL);
             std::signal(SIGTTIN, SIG_DFL);
             std::signal(SIGTTOU, SIG_DFL);
 
-            // Every stage except the first reads from the previous pipe.
+            // Connect this stage to the previous pipeline stage.
             if (i > 0) {
                 if (dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
                     std::perror("dup2 stdin");
@@ -121,7 +118,7 @@ int PipelineExecutor::executePipeline(
                 }
             }
 
-            // Every stage except the last writes to the next pipe.
+            // Connect this stage to the next pipeline stage.
             if (i + 1 < commandCount) {
                 if (dup2(pipes[i][1], STDOUT_FILENO) == -1) {
                     std::perror("dup2 stdout");
@@ -129,50 +126,62 @@ int PipelineExecutor::executePipeline(
                 }
             }
 
-            // The child now uses stdin/stdout, so close all original pipe FDs.
+            // Close inherited pipe descriptors after duplicating the
+            // endpoints needed for this stage.
             for (const auto& pipeFd : pipes) {
                 close(pipeFd[0]);
                 close(pipeFd[1]);
             }
 
-            // execvp() expects argv to end with a null pointer.
-            std::vector<char*> argv;
-            argv.reserve(commands[i].size() + 1);
+            // Explicit file redirection takes precedence over the
+            // corresponding pipeline connection.
+            RedirectionFailure failure;
 
-            for (const std::string& arg : commands[i]) {
-                argv.push_back(const_cast<char*>(arg.c_str()));
+            if (!Redirection::applyInChild(
+                    commands[i].redirection, failure)) {
+                Redirection::reportFailure(failure);
+                _exit(1);
             }
+
+            const std::vector<std::string>& arguments =
+                commands[i].arguments;
+
+            std::vector<char*> argv;
+            argv.reserve(arguments.size() + 1);
+
+            for (const std::string& argument : arguments) {
+                argv.push_back(
+                    const_cast<char*>(argument.c_str())
+                );
+            }
+
             argv.push_back(nullptr);
 
             execvp(argv[0], argv.data());
 
-            // execvp() returns only when launching the command fails.
             const int executionError = errno;
-            std::perror(commands[i][0].c_str());
+            std::perror(arguments[0].c_str());
 
             _exit(
-                (executionError == ENOENT || executionError == ENOTDIR)
+                executionError == ENOENT || executionError == ENOTDIR
                     ? 127
                     : 126
             );
         }
 
-        // Parent records the child and continues launching stages.
         childPids.push_back(pid);
     }
 
-    // Critical: the parent must close all its own pipe descriptors.
-    // Otherwise, a reader may never observe EOF.
+    // The parent must release its own copies of every pipe descriptor.
     closeAllPipes();
 
-    // Wait for each child, retrying if a wait is interrupted by a signal.
-    // Pipeline status is determined by the last command's status.
     std::vector<int> statuses(commandCount, 0);
     bool waitFailed = false;
 
     for (std::size_t i = 0; i < commandCount; ++i) {
         while (true) {
-            const pid_t waited = waitpid(childPids[i], &statuses[i], 0);
+            const pid_t waited =
+                waitpid(childPids[i], &statuses[i], 0);
 
             if (waited == childPids[i]) {
                 break;
@@ -192,6 +201,7 @@ int PipelineExecutor::executePipeline(
         return 1;
     }
 
+    // The status of a pipeline is the status of its final stage.
     const int lastStatus = statuses.back();
 
     if (WIFEXITED(lastStatus)) {

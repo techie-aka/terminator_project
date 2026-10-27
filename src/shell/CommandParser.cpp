@@ -1,4 +1,5 @@
 #include "shell/CommandParser.h"
+#include "shell/Redirection.h"
 
 #include <cctype>
 #include <string>
@@ -222,6 +223,243 @@ std::vector<std::string> CommandParser::parse(
     }
 
     return arguments;
+}
+
+bool CommandParser::parseCommand(
+    const std::string& input,
+    int lastExitStatus,
+    ParsedCommand& result,
+    std::string& errorMessage
+) const {
+    result = ParsedCommand{};
+    errorMessage.clear();
+
+    std::string commandText;
+    char quote = '\0';
+    bool escaped = false;
+
+    auto isSpace = [](char c) {
+        return std::isspace(static_cast<unsigned char>(c)) != 0;
+    };
+
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        const char c = input[i];
+
+        if (escaped) {
+            commandText += c;
+            escaped = false;
+            continue;
+        }
+
+        // Preserve escaped operators as ordinary command text.
+        if (c == '\\' && quote != '\'') {
+            bool escapesNext = true;
+
+            if (quote == '"') {
+                escapesNext =
+                    i + 1 < input.size() &&
+                    (input[i + 1] == '"' ||
+                     input[i + 1] == '\\' ||
+                     input[i + 1] == '$' ||
+                     input[i + 1] == '`' ||
+                     input[i + 1] == '\n');
+            }
+
+            commandText += c;
+
+            if (escapesNext && i + 1 < input.size()) {
+                escaped = true;
+            }
+
+            continue;
+        }
+
+        // Inside quotes, redirection characters are ordinary text.
+        if (quote != '\0') {
+            commandText += c;
+
+            if (c == quote) {
+                quote = '\0';
+            }
+
+            continue;
+        }
+
+        if (c == '\'' || c == '"') {
+            quote = c;
+            commandText += c;
+            continue;
+        }
+
+        if (c != '<' && c != '>') {
+            commandText += c;
+            continue;
+        }
+
+        const char operation = c;
+
+        // Append redirection and here-documents are not supported.
+        if (i + 1 < input.size() && input[i + 1] == operation) {
+            errorMessage = operation == '>'
+                ? "append redirection (>>) is not supported"
+                : "here-documents (<<) are not supported";
+            return false;
+        }
+
+        // Reject stderr redirection rather than interpreting "2" as
+        // an ordinary argument.
+        if (operation == '>' &&
+            i > 0 &&
+            input[i - 1] == '2' &&
+            (i == 1 || isSpace(input[i - 2]))) {
+            errorMessage = "stderr redirection (2>) is not supported";
+            return false;
+        }
+
+        // Skip whitespace before the filename.
+        std::size_t targetStart = i + 1;
+
+        while (targetStart < input.size() &&
+               isSpace(input[targetStart])) {
+            ++targetStart;
+        }
+
+        if (targetStart >= input.size() ||
+            input[targetStart] == '<' ||
+            input[targetStart] == '>') {
+            errorMessage = "redirection operator requires a filename";
+            return false;
+        }
+
+        // Read one filename expression, keeping quoted spaces together.
+        std::size_t targetEnd = targetStart;
+        char targetQuote = '\0';
+        bool targetEscaped = false;
+
+        while (targetEnd < input.size()) {
+            const char targetChar = input[targetEnd];
+
+            if (targetEscaped) {
+                targetEscaped = false;
+                ++targetEnd;
+                continue;
+            }
+
+            if (targetChar == '\\' && targetQuote != '\'') {
+                bool escapesNext = true;
+
+                if (targetQuote == '"') {
+                    escapesNext =
+                        targetEnd + 1 < input.size() &&
+                        (input[targetEnd + 1] == '"' ||
+                         input[targetEnd + 1] == '\\' ||
+                         input[targetEnd + 1] == '$' ||
+                         input[targetEnd + 1] == '`' ||
+                         input[targetEnd + 1] == '\n');
+                }
+
+                if (escapesNext && targetEnd + 1 < input.size()) {
+                    targetEscaped = true;
+                    ++targetEnd;
+                    continue;
+                }
+            }
+
+            if (targetQuote == '\'') {
+                if (targetChar == '\'') {
+                    targetQuote = '\0';
+                }
+
+                ++targetEnd;
+                continue;
+            }
+
+            if (targetQuote == '"') {
+                if (targetChar == '"') {
+                    targetQuote = '\0';
+                }
+
+                ++targetEnd;
+                continue;
+            }
+
+            if (targetChar == '\'' || targetChar == '"') {
+                targetQuote = targetChar;
+                ++targetEnd;
+                continue;
+            }
+
+            if (isSpace(targetChar) ||
+                targetChar == '<' ||
+                targetChar == '>') {
+                break;
+            }
+
+            ++targetEnd;
+        }
+
+        if (targetQuote != '\0') {
+            errorMessage = "unterminated quote in redirection filename";
+            return false;
+        }
+
+        const std::string filenameExpression =
+            input.substr(targetStart, targetEnd - targetStart);
+
+        // Reuse the existing tokenizer, including its quote and escape
+        // handling, rather than implementing a second tokenizer.
+        const std::vector<std::string> filenameArguments =
+            parse(filenameExpression, lastExitStatus);
+
+        if (filenameArguments.size() != 1 ||
+            filenameArguments[0].empty()) {
+            errorMessage =
+                "redirection requires exactly one non-empty filename";
+            return false;
+        }
+
+        const std::string& filename = filenameArguments[0];
+
+        if (operation == '<') {
+            if (result.redirection.hasInput) {
+                errorMessage =
+                    "multiple input redirections are not supported";
+                return false;
+            }
+
+            result.redirection.hasInput = true;
+            result.redirection.inputFile = filename;
+        } else {
+            if (result.redirection.hasOutput) {
+                errorMessage =
+                    "multiple output redirections are not supported";
+                return false;
+            }
+
+            result.redirection.hasOutput = true;
+            result.redirection.outputFile = filename;
+        }
+
+        // Remove redirection syntax from the command being tokenized.
+        commandText += ' ';
+        i = targetEnd - 1;
+    }
+
+    if (quote != '\0') {
+        errorMessage = "unterminated quote in command";
+        return false;
+    }
+
+    result.arguments = parse(commandText, lastExitStatus);
+
+    if (result.arguments.empty() &&
+        (result.redirection.hasInput ||
+         result.redirection.hasOutput)) {
+        errorMessage = "redirection requires a command";
+        return false;
+    }
+
+    return true;
 }
 
 std::vector<std::string> CommandParser::splitPipeline(

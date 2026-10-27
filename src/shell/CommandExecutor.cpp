@@ -1,25 +1,80 @@
 #include "shell/CommandExecutor.h"
+#include "shell/Redirection.h"
 
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
-
 #include <cstring>
+#include <iostream>
 #include <vector>
-#include <array>
 
 #include <fcntl.h>
-#include <iostream>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+
+constexpr int EXEC_FAILURE = 1;
+constexpr int REDIRECTION_FAILURE = 2;
+
+struct ChildSetupFailure {
+    int errorNumber;
+    int kind;
+    bool input;
+};
+
+// Report a child setup failure through the close-on-exec status pipe.
+void reportChildFailure(
+    int fd,
+    int errorNumber,
+    int kind,
+    bool input = false
+) {
+    const ChildSetupFailure failure{errorNumber, kind, input};
+    const char* data = reinterpret_cast<const char*>(&failure);
+    std::size_t remaining = sizeof(failure);
+
+    while (remaining > 0) {
+        const ssize_t written = write(fd, data, remaining);
+
+        if (written > 0) {
+            data += written;
+            remaining -= static_cast<std::size_t>(written);
+        } else if (written == -1 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+// Wait for one specific child, retrying interrupted waits.
+bool waitForChild(pid_t pid, int& status) {
+    while (true) {
+        const pid_t result = waitpid(pid, &status, 0);
+
+        if (result == pid) {
+            return true;
+        }
+
+        if (result == -1 && errno == EINTR) {
+            continue;
+        }
+
+        return false;
+    }
+}
+
+} // namespace
 
 int CommandExecutor::execute(
     const std::vector<std::string>& arguments,
     bool background,
     pid_t* startedProcess,
     pid_t* startedProcessGroup,
-    bool* processStopped
+    bool* processStopped,
+    const RedirectionSpec* redirection
 ) const {
     if (startedProcess != nullptr) {
         *startedProcess = -1;
@@ -37,8 +92,9 @@ int CommandExecutor::execute(
         return 0;
     }
 
-    // execvp() requires a null-terminated array of C-style strings.
+    // execvp() expects a null-terminated argv array.
     std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
 
     for (const std::string& argument : arguments) {
         argv.push_back(const_cast<char*>(argument.c_str()));
@@ -46,7 +102,8 @@ int CommandExecutor::execute(
 
     argv.push_back(nullptr);
 
-    // This pipe tells the parent whether execvp() succeeded.
+    // The status pipe distinguishes successful exec from setup failure.
+    // FD_CLOEXEC closes the write end automatically after successful exec.
     int execStatusPipe[2];
 
     if (pipe(execStatusPipe) == -1) {
@@ -55,12 +112,16 @@ int CommandExecutor::execute(
         return 1;
     }
 
-    // Successful execvp() closes the write end automatically.
     const int flags = fcntl(execStatusPipe[1], F_GETFD);
 
     if (flags == -1 ||
-        fcntl(execStatusPipe[1], F_SETFD, flags | FD_CLOEXEC) == -1) {
+        fcntl(
+            execStatusPipe[1],
+            F_SETFD,
+            flags | FD_CLOEXEC
+        ) == -1) {
         const int savedError = errno;
+
         close(execStatusPipe[0]);
         close(execStatusPipe[1]);
 
@@ -73,6 +134,7 @@ int CommandExecutor::execute(
 
     if (childPid == -1) {
         const int savedError = errno;
+
         close(execStatusPipe[0]);
         close(execStatusPipe[1]);
 
@@ -84,81 +146,135 @@ int CommandExecutor::execute(
     if (childPid == 0) {
         close(execStatusPipe[0]);
 
-        // Give the child its own process group.
+        // Give the external command its own process group.
         (void)setpgid(0, 0);
 
-        // External programs must have normal signal behavior.
+        // External programs must have ordinary signal behavior.
         std::signal(SIGINT, SIG_DFL);
         std::signal(SIGQUIT, SIG_DFL);
         std::signal(SIGTSTP, SIG_DFL);
         std::signal(SIGTTIN, SIG_DFL);
         std::signal(SIGTTOU, SIG_DFL);
 
+        // Redirection must succeed before the command is executed.
+        if (redirection != nullptr) {
+            RedirectionFailure failure;
+
+            if (!Redirection::applyInChild(*redirection, failure)) {
+                reportChildFailure(
+                    execStatusPipe[1],
+                    failure.errorNumber,
+                    REDIRECTION_FAILURE,
+                    failure.input
+                );
+
+                _exit(1);
+            }
+        }
+
         execvp(argv[0], argv.data());
 
-        // Reached only if execvp() failed.
-        const int executionError = errno;
-
-        // Send the error to the parent before terminating.
-        (void)write(
+        // execvp() returns only if execution failed.
+        reportChildFailure(
             execStatusPipe[1],
-            &executionError,
-            sizeof(executionError)
+            errno,
+            EXEC_FAILURE
         );
 
         _exit(
-            executionError == ENOENT || executionError == ENOTDIR
-                ? 127
-                : 126
+            errno == ENOENT || errno == ENOTDIR ? 127 : 126
         );
     }
 
     close(execStatusPipe[1]);
 
-    // Establish the child's process group from the parent side too.
+    // Establish the process group from the parent side too.
     (void)setpgid(childPid, childPid);
 
-    // A successful exec closes the pipe; a failed exec sends errno.
-    int executionError = 0;
-    ssize_t statusBytes;
+    // Successful exec produces EOF on this pipe.
+    // Failures send a complete ChildSetupFailure structure.
+    ChildSetupFailure childFailure{};
+    char* destination = reinterpret_cast<char*>(&childFailure);
+    std::size_t bytesReceived = 0;
+    bool statusReadFailed = false;
 
-    do {
-        statusBytes = read(
+    while (bytesReceived < sizeof(childFailure)) {
+        const ssize_t bytesRead = read(
             execStatusPipe[0],
-            &executionError,
-            sizeof(executionError)
+            destination + bytesReceived,
+            sizeof(childFailure) - bytesReceived
         );
-    } while (statusBytes == -1 && errno == EINTR);
+
+        if (bytesRead > 0) {
+            bytesReceived += static_cast<std::size_t>(bytesRead);
+        } else if (bytesRead == 0) {
+            break;
+        } else if (errno == EINTR) {
+            continue;
+        } else {
+            statusReadFailed = true;
+            break;
+        }
+    }
 
     close(execStatusPipe[0]);
 
-    if (statusBytes != 0) {
-        // Do not register an unsuccessful exec as a running job.
-        int childStatus = 0;
+    if (statusReadFailed) {
+        const int savedError = errno;
 
-        while (waitpid(childPid, &childStatus, 0) == -1 &&
-               errno == EINTR) {
-        }
+        (void)kill(childPid, SIGTERM);
 
-        if (statusBytes > 0) {
-            if (executionError == ENOENT ||
-                executionError == ENOTDIR) {
-                std::cerr << "terminator: " << arguments[0]
-                          << ": command not found\n";
-                return 127;
-            }
+        int ignoredStatus = 0;
+        (void)waitForChild(childPid, ignoredStatus);
 
-            std::cerr << "terminator: " << arguments[0]
-                      << ": " << std::strerror(executionError) << '\n';
-            return 126;
-        }
-
-        std::cerr << "terminator: cannot confirm command execution: "
-                  << std::strerror(errno) << '\n';
+        std::cerr << "terminator: cannot read child setup status: "
+                  << std::strerror(savedError) << '\n';
         return 1;
     }
 
-    // Register the process only after execvp() succeeds.
+    if (bytesReceived != 0) {
+        int childStatus = 0;
+
+        if (!waitForChild(childPid, childStatus)) {
+            std::cerr << "terminator: waitpid: "
+                      << std::strerror(errno) << '\n';
+            return 1;
+        }
+
+        if (bytesReceived != sizeof(childFailure)) {
+            std::cerr << "terminator: incomplete child setup status\n";
+            return 1;
+        }
+
+        if (childFailure.kind == REDIRECTION_FAILURE) {
+            RedirectionFailure failure;
+            failure.errorNumber = childFailure.errorNumber;
+            failure.input = childFailure.input;
+
+            if (redirection != nullptr) {
+                failure.filename = failure.input
+                    ? redirection->inputFile
+                    : redirection->outputFile;
+            }
+
+            Redirection::reportFailure(failure);
+            return 1;
+        }
+
+        if (childFailure.errorNumber == ENOENT ||
+            childFailure.errorNumber == ENOTDIR) {
+            std::cerr << "terminator: " << arguments[0]
+                      << ": command not found\n";
+            return 127;
+        }
+
+        std::cerr << "terminator: " << arguments[0]
+                  << ": " << std::strerror(childFailure.errorNumber)
+                  << '\n';
+        return 126;
+    }
+
+    // Only successfully executed commands can be registered as jobs.
     if (startedProcess != nullptr) {
         *startedProcess = childPid;
     }
@@ -167,12 +283,11 @@ int CommandExecutor::execute(
         *startedProcessGroup = childPid;
     }
 
-    // A successfully launched background command returns immediately.
     if (background) {
         return 0;
     }
 
-    // Give the foreground command control of the terminal.
+    // Give a foreground command access to the terminal.
     const pid_t shellProcessGroup = getpgrp();
     bool terminalHandedOver = false;
 
@@ -188,12 +303,11 @@ int CommandExecutor::execute(
         waitResult = waitpid(childPid, &status, WUNTRACED);
     } while (waitResult == -1 && errno == EINTR);
 
-    // Restore terminal ownership to the shell.
-    if (terminalHandedOver) {
-        if (tcsetpgrp(STDIN_FILENO, shellProcessGroup) == -1) {
-            std::cerr << "terminator: tcsetpgrp: "
-                      << std::strerror(errno) << '\n';
-        }
+    // Restore the shell's terminal ownership.
+    if (terminalHandedOver &&
+        tcsetpgrp(STDIN_FILENO, shellProcessGroup) == -1) {
+        std::cerr << "terminator: tcsetpgrp: "
+                  << std::strerror(errno) << '\n';
     }
 
     if (waitResult == -1) {
