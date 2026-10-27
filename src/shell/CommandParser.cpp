@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstdlib>
 
+#include <glob.h>
+
 // Expand a variable such as $HOME or ${HOME}.
 // Returns false when the '$' does not begin a supported variable name.
 // An environment variable that is not set expands to an empty string.
@@ -99,12 +101,53 @@ bool appendEnvironmentVariable(
     return true;
 }
 
+// Expand unquoted filename patterns such as *.txt.
+// If nothing matches, preserve the original argument literally.
+void appendArgumentWithExpansion(
+    std::vector<std::string>& arguments,
+    const std::string& argument,
+    bool expandWildcards
+) {
+    // Arguments without unquoted wildcard characters remain unchanged.
+    if (!expandWildcards) {
+        arguments.push_back(argument);
+        return;
+    }
+
+    glob_t matches{};
+
+    // Ask the operating system's pathname-matching library
+    // to expand the wildcard pattern.
+    const int result = glob(
+        argument.c_str(),
+        0,
+        nullptr,
+        &matches
+    );
+
+    if (result == 0) {
+        // Append each matched filename as a separate argument.
+        for (std::size_t i = 0; i < matches.gl_pathc; ++i) {
+            arguments.emplace_back(matches.gl_pathv[i]);
+        }
+    } else {
+        // Shell-like behavior: keep unmatched patterns unchanged.
+        arguments.push_back(argument);
+    }
+
+    // Release memory allocated by glob().
+    globfree(&matches);
+}
+
 std::vector<std::string> CommandParser::parse(
     const std::string& input,
     int lastExitStatus
 ) const {
     std::vector<std::string> arguments;
     std::string currentArgument;
+
+    // True only when an unquoted, unescaped wildcard appears.
+    bool currentArgumentHasWildcard = false;
 
     // Track whether we are inside single or double quotes.
     char quote = '\0';
@@ -174,10 +217,16 @@ std::vector<std::string> CommandParser::parse(
         // Outside quotes, whitespace ends the current argument.
         if (std::isspace(static_cast<unsigned char>(character))) {
             if (insideArgument) {
-                arguments.push_back(currentArgument);
-                currentArgument.clear();
-                insideArgument = false;
-            }
+            appendArgumentWithExpansion(
+                arguments,
+                currentArgument,
+                currentArgumentHasWildcard
+            );
+
+            currentArgument.clear();
+            currentArgumentHasWildcard = false;
+            insideArgument = false;
+        }
 
             continue;
         }
@@ -213,13 +262,25 @@ std::vector<std::string> CommandParser::parse(
             continue;
         }
 
+        // Wildcards are active only when encountered outside quotes
+        // and outside the backslash-escape handling above.
+        if (character == '*' ||
+            character == '?' ||
+            character == '[') {
+            currentArgumentHasWildcard = true;
+        }
+
         currentArgument += character;
         insideArgument = true;
     }
 
     // Preserve the final argument, including an empty quoted argument.
     if (insideArgument) {
-        arguments.push_back(currentArgument);
+        appendArgumentWithExpansion(
+            arguments,
+            currentArgument,
+            currentArgumentHasWildcard
+        );
     }
 
     return arguments;
