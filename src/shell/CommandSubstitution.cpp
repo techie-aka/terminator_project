@@ -145,6 +145,75 @@ std::size_t findMatchingParen(
     return std::string::npos;
 }
 
+// Find the closing backtick for a backtick substitution.
+// Quotes and escaped backticks inside the command must not
+// prematurely terminate the substitution.
+std::size_t findMatchingBacktick(
+    const std::string& input,
+    std::size_t start
+) {
+    if (start >= input.size() || input[start] != '`') {
+        return std::string::npos;
+    }
+
+    char quote = '\0';
+    bool escaped = false;
+
+    for (std::size_t i = start + 1; i < input.size(); ++i) {
+        const char c = input[i];
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        // Single-quoted content is literal.
+        if (quote == '\'') {
+            if (c == '\'') {
+                quote = '\0';
+            }
+            continue;
+        }
+
+        // Ignore escaped delimiters while scanning the command.
+        if (c == '\\' && i + 1 < input.size()) {
+            const char next = input[i + 1];
+
+            if (quote != '"' ||
+                next == '"' || next == '\\' ||
+                next == '$' || next == '`' ||
+                next == '\n') {
+                escaped = true;
+                continue;
+            }
+        }
+
+        if (quote == '"') {
+            if (c == '"') {
+                quote = '\0';
+            }
+            continue;
+        }
+
+        if (c == '\'') {
+            quote = '\'';
+            continue;
+        }
+
+        if (c == '"') {
+            quote = '"';
+            continue;
+        }
+
+        // An unquoted, unescaped backtick closes this substitution.
+        if (c == '`') {
+            return i;
+        }
+    }
+
+    return std::string::npos;
+}
+
 // Execute a command callback in a child and capture its stdout through a pipe.
 // Stderr remains attached to the terminal, as it normally does for $(...).
 bool captureOutput(
@@ -343,6 +412,41 @@ bool CommandSubstitution::expand(
                 continue;
             }
 
+            // Execute backtick substitution inside double quotes.
+            if (c == '`') {
+                const std::size_t end = findMatchingBacktick(input, i);
+
+                if (end == std::string::npos) {
+                    errorMessage = "unterminated backtick command substitution";
+                    return false;
+                }
+
+                // Extract the command between the opening and closing backticks.
+                const std::string innerCommand =
+                    input.substr(i + 1, end - i - 1);
+
+                std::string capturedOutput;
+
+                if (!captureOutput(
+                        innerCommand,
+                        runCommand,
+                        capturedOutput,
+                        errorMessage)) {
+                    return false;
+                }
+
+                // Shell command substitution removes trailing newline characters.
+                removeTrailingNewlines(capturedOutput);
+
+                // Keep substituted characters inside the current double-quoted
+                // argument rather than letting them become shell syntax.
+                expandedCommand += protectOutput(capturedOutput, '"');
+
+                // Skip the entire substitution, including its closing backtick.
+                i = end;
+                continue;
+            }
+
             expandedCommand += c;
             continue;
         }
@@ -377,6 +481,41 @@ bool CommandSubstitution::expand(
 
             removeTrailingNewlines(capturedOutput);
             expandedCommand += protectOutput(capturedOutput, '\0');
+            i = end;
+            continue;
+        }
+
+        // Execute unquoted backtick substitution.
+        if (c == '`') {
+            const std::size_t end = findMatchingBacktick(input, i);
+
+            if (end == std::string::npos) {
+                errorMessage = "unterminated backtick command substitution";
+                return false;
+            }
+
+            // Extract the command between the backticks.
+            const std::string innerCommand =
+                input.substr(i + 1, end - i - 1);
+
+            std::string capturedOutput;
+
+            if (!captureOutput(
+                    innerCommand,
+                    runCommand,
+                    capturedOutput,
+                    errorMessage)) {
+                return false;
+            }
+
+            // Remove trailing newline characters, as shell substitution does.
+            removeTrailingNewlines(capturedOutput);
+
+            // Preserve special characters in the result as data.
+            // Unquoted whitespace remains available for word splitting.
+            expandedCommand += protectOutput(capturedOutput, '\0');
+
+            // Skip over the closing backtick.
             i = end;
             continue;
         }

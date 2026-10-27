@@ -3,6 +3,100 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#include <cstdlib>
+
+// Expand a variable such as $HOME or ${HOME}.
+// Returns false when the '$' does not begin a supported variable name.
+// An environment variable that is not set expands to an empty string.
+bool appendEnvironmentVariable(
+    const std::string& input,
+    std::size_t& position,
+    std::string& output
+) {
+    if (position >= input.size() || input[position] != '$') {
+        return false;
+    }
+
+    const std::size_t nameStart = position + 1;
+    if (nameStart >= input.size()) {
+        return false;
+    }
+
+    std::string name;
+
+    if (input[nameStart] == '{') {
+        // Handle ${HOME} syntax.
+        const std::size_t closingBrace = input.find('}', nameStart + 1);
+
+        if (closingBrace == std::string::npos) {
+            return false;
+        }
+
+        name = input.substr(
+            nameStart + 1,
+            closingBrace - nameStart - 1
+        );
+
+        position = closingBrace;
+    } else {
+        // Handle $HOME syntax.
+        const auto isFirstCharacter = [](unsigned char c) {
+            return (c >= 'A' && c <= 'Z') ||
+                   (c >= 'a' && c <= 'z') ||
+                   c == '_';
+        };
+
+        const auto isNameCharacter = [&](unsigned char c) {
+            return isFirstCharacter(c) ||
+                   (c >= '0' && c <= '9');
+        };
+
+        if (!isFirstCharacter(
+                static_cast<unsigned char>(input[nameStart]))) {
+            return false;
+        }
+
+        std::size_t end = nameStart + 1;
+
+        while (end < input.size() &&
+               isNameCharacter(static_cast<unsigned char>(input[end]))) {
+            ++end;
+        }
+
+        name = input.substr(nameStart, end - nameStart);
+        position = end - 1;
+    }
+
+    // Reject unsupported variable-name syntax rather than partially
+    // interpreting expressions such as ${HOME:-fallback}.
+    if (name.empty()) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+
+        const bool valid = i == 0
+            ? ((c >= 'A' && c <= 'Z') ||
+               (c >= 'a' && c <= 'z') || c == '_')
+            : ((c >= 'A' && c <= 'Z') ||
+               (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') || c == '_');
+
+        if (!valid) {
+            return false;
+        }
+    }
+
+    const char* value = std::getenv(name.c_str());
+
+    // An undefined environment variable expands to an empty string.
+    if (value != nullptr) {
+        output += value;
+    }
+
+    return true;
+}
 
 std::vector<std::string> CommandParser::parse(
     const std::string& input,
@@ -45,6 +139,13 @@ std::vector<std::string> CommandParser::parse(
                 input[i + 1] == '?') {
                 currentArgument += std::to_string(lastExitStatus);
                 ++i;
+                continue;
+            }
+
+            // Expand environment variables inside double quotes.
+            if (character == '$' &&
+                appendEnvironmentVariable(input, i, currentArgument)) {
+                insideArgument = true;
                 continue;
             }
 
@@ -101,6 +202,13 @@ std::vector<std::string> CommandParser::parse(
             currentArgument += std::to_string(lastExitStatus);
             insideArgument = true;
             ++i;
+            continue;
+        }
+
+        // Expand environment variables outside quotes as well.
+        if (character == '$' &&
+            appendEnvironmentVariable(input, i, currentArgument)) {
+            insideArgument = true;
             continue;
         }
 
