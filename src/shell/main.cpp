@@ -4,6 +4,7 @@
 #include "shell/History.h"
 #include "shell/JobManager.h"
 #include "shell/PipelineExecutor.h"
+#include "shell/CommandSubstitution.h"
 
 #include <csignal>
 #include <functional>
@@ -387,6 +388,7 @@ int main() {
     History history;
     JobManager jobs;
     PipelineExecutor pipelineExecutor;
+    CommandSubstitution commandSubstitution;
 
     if (!history.isReady()) {
         std::cerr << "terminator: shared history is unavailable\n";
@@ -400,8 +402,19 @@ int main() {
     std::function<int(const std::string&)> executeLine;
 
     executeLine = [&](const std::string& commandLine) -> int {
-        std::string commandToParse = commandLine;
+        
+        std::string commandToParse;
+        std::string substitutionError;
 
+        if (!commandSubstitution.expand(
+                commandLine,
+                executeLine,
+                commandToParse,
+                substitutionError)) {
+            std::cerr << "terminator: " << substitutionError << '\n';
+            lastExitStatus = 2;
+            return lastExitStatus;
+        }
         // Recognize a trailing '&' as background execution.
         // Quote-aware parsing will be added in Task 3.
         const std::size_t lastCharacter =
