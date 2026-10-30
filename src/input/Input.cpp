@@ -18,12 +18,10 @@ bool Input::handleKeyPress(XKeyEvent& keyEvent) {
         &keyEvent, buffer, sizeof(buffer), &keySymbol, nullptr
     );
 
-    // Enter
     if (keySymbol == XK_Return || keySymbol == XK_KP_Enter) {
         return true;
     }
 
-    // Backspace
     if (keySymbol == XK_BackSpace) {
         if (!text.empty()) {
             text.pop_back();
@@ -32,7 +30,6 @@ bool Input::handleKeyPress(XKeyEvent& keyEvent) {
         return false;
     }
 
-    // Normal character
     if (length > 0) {
         text.append(buffer, length);
     }
@@ -48,6 +45,50 @@ void Input::clear() {
     text.clear();
 }
 
+// Recognise application-level shortcuts.
+// These must be handled by the GUI rather than sent to the shell.
+InputAction Input::getAction(XKeyEvent& keyEvent) const {
+    const KeySym keySymbol = XLookupKeysym(&keyEvent, 0);
+    const KeySym shiftedSymbol = XLookupKeysym(&keyEvent, 1);
+
+    const bool controlPressed =
+        (keyEvent.state & ControlMask) != 0;
+
+    const bool shiftPressed =
+        (keyEvent.state & ShiftMask) != 0;
+
+    if (!controlPressed) {
+        return InputAction::NoAction;
+    }
+
+    // Ctrl+Tab moves forward; Ctrl+Shift+Tab moves backward.
+    // Some X11 keyboard mappings report Shift+Tab as ISO_Left_Tab.
+    const bool isTabKey =
+        keySymbol == XK_Tab ||
+        keySymbol == XK_ISO_Left_Tab ||
+        shiftedSymbol == XK_ISO_Left_Tab;
+
+    if (isTabKey) {
+        return shiftPressed
+            ? InputAction::PreviousTab
+            : InputAction::NextTab;
+    }
+
+    // Ctrl+Shift+T: create a tab.
+    if (shiftPressed &&
+        (keySymbol == XK_t || keySymbol == XK_T)) {
+        return InputAction::NewTab;
+    }
+
+    // Ctrl+Shift+W: close the active tab.
+    if (shiftPressed &&
+        (keySymbol == XK_w || keySymbol == XK_W)) {
+        return InputAction::CloseTab;
+    }
+
+    return InputAction::NoAction;
+}
+
 string Input::translateKeyPress(XKeyEvent& keyEvent) {
     char buffer[32];
     KeySym keySymbol;
@@ -56,7 +97,7 @@ string Input::translateKeyPress(XKeyEvent& keyEvent) {
         &keyEvent, buffer, sizeof(buffer), &keySymbol, nullptr
     );
 
-    // Translate Enter and editing/navigation keys into terminal input.
+    // Translate special keys into terminal escape sequences.
     switch (keySymbol) {
         case XK_Return:
         case XK_KP_Enter:
@@ -90,24 +131,56 @@ string Input::translateKeyPress(XKeyEvent& keyEvent) {
             break;
     }
 
-    // Preserve standard terminal signals for Ctrl+C and Ctrl+D.
-    if (keyEvent.state & ControlMask) {
-        if (keySymbol == XK_c || keySymbol == XK_C) {
-            return "\x03";
-        }
+    const bool controlPressed =
+        (keyEvent.state & ControlMask) != 0;
 
-        if (keySymbol == XK_d || keySymbol == XK_D) {
-            return "\x04";
-        }
+    const bool shiftPressed =
+        (keyEvent.state & ShiftMask) != 0;
 
-        if (keySymbol == XK_z || keySymbol == XK_Z) {
-            return "\x1a";
-        }
-
-        // Ctrl+Shift+T is handled by the application controller.
-        if (keyEvent.state & ShiftMask &&
-            (keySymbol == XK_t || keySymbol == XK_T)) {
+    if (controlPressed) {
+        // Reserve Ctrl+Shift+C/V for the upcoming clipboard checkpoint.
+        // In particular, Ctrl+Shift+C must never become Ctrl+C.
+        if (shiftPressed &&
+            (keySymbol == XK_c || keySymbol == XK_C ||
+             keySymbol == XK_v || keySymbol == XK_V)) {
             return "";
+        }
+
+        switch (keySymbol) {
+            case XK_a:
+            case XK_A:
+                return "\x01"; // Ctrl+A
+
+            case XK_e:
+            case XK_E:
+                return "\x05"; // Ctrl+E
+
+            case XK_u:
+            case XK_U:
+                return "\x15"; // Ctrl+U
+
+            case XK_k:
+            case XK_K:
+                return "\x0b"; // Ctrl+K
+
+            case XK_w:
+            case XK_W:
+                return "\x17"; // Ctrl+W
+
+            case XK_c:
+            case XK_C:
+                return "\x03"; // Ctrl+C
+
+            case XK_d:
+            case XK_D:
+                return "\x04"; // Ctrl+D
+
+            case XK_z:
+            case XK_Z:
+                return "\x1a"; // Ctrl+Z
+
+            default:
+                break;
         }
     }
 

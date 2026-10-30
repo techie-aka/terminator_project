@@ -1,8 +1,17 @@
 #ifndef INPUT_H
 #define INPUT_H
 
-#include <X11/Xlib.h>
 #include <string>
+#include <X11/Xlib.h>
+
+// Application-level keyboard shortcuts recognised by Input.
+enum class InputAction {
+    NoAction,
+    NextTab,
+    PreviousTab,
+    NewTab,
+    CloseTab
+};
 
 class Input {
 private:
@@ -11,13 +20,16 @@ private:
 public:
     Input();
 
-    // Returns true when the user presses Enter
     bool handleKeyPress(XKeyEvent& keyEvent);
 
     std::string getText() const;
-    std::string translateKeyPress(XKeyEvent& keyEvent);
-
     void clear();
+
+    // Identify application shortcuts without sending them to the shell.
+    InputAction getAction(XKeyEvent& keyEvent) const;
+
+    // Convert ordinary keys into terminal input bytes/sequences.
+    std::string translateKeyPress(XKeyEvent& keyEvent);
 };
 
-#endif
+#endif // INPUT_H

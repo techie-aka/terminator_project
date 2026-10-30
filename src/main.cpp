@@ -4,8 +4,6 @@
 #include "terminal/TerminalConfig.h"
 #include "terminal/Terminal.h"
 
-#include <X11/keysym.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -398,31 +396,61 @@ int main() {
                     draggingScrollbar = false;
                 }
             } else if (event.type == KeyPress) {
-                const KeySym keySymbol = XLookupKeysym(&event.xkey, 0);
 
-                // Ctrl+Shift+T creates a new tab.
-                if ((event.xkey.state & ControlMask) &&
-                    (event.xkey.state & ShiftMask) &&
-                    (keySymbol == XK_t || keySymbol == XK_T)) {
-                    if (createTab()) {
+                // Ask Input to identify application-level keyboard shortcuts.
+                const InputAction action = input.getAction(event.xkey);
+
+                switch (action) {
+
+                    case InputAction::NewTab:
+                        if (createTab()) {
+                            redraw = true;
+                        }
+                        continue;
+
+                    case InputAction::CloseTab:
+                        if (!closeTab()) {
+                            return 0;
+                        }
+
                         redraw = true;
-                    }
+                        continue;
 
-                    continue;
+                    case InputAction::NextTab:
+                        if (terminals.size() > 1) {
+                            // Move forward and wrap around to the first tab.
+                            activeTab = (activeTab + 1) %
+                                static_cast<int>(terminals.size());
+
+                            draggingScrollbar = false;
+                            cursorVisible = true;
+                            lastBlink = chrono::steady_clock::now();
+
+                            redraw = true;
+                        }
+                        continue;
+
+                    case InputAction::PreviousTab:
+                        if (terminals.size() > 1) {
+                            // Move backward and wrap around to the last tab.
+                            activeTab =
+                                (activeTab - 1 + static_cast<int>(terminals.size())) %
+                                static_cast<int>(terminals.size());
+
+                            draggingScrollbar = false;
+                            cursorVisible = true;
+                            lastBlink = chrono::steady_clock::now();
+
+                            redraw = true;
+                        }
+                        continue;
+
+                    case InputAction::NoAction:
+                        break;
                 }
 
-                // Ctrl+Shift+W closes the active tab.
-                if ((event.xkey.state & ControlMask) &&
-                    (event.xkey.state & ShiftMask) &&
-                    (keySymbol == XK_w || keySymbol == XK_W)) {
-                    if (!closeTab()) {
-                        return 0;
-                    }
-
-                    redraw = true;
-                    continue;
-                }
-
+                // No application shortcut was detected.
+                // Forward ordinary keyboard input to the active shell.
                 Terminal& terminal = *terminals[activeTab];
 
                 const int oldTotalLines = static_cast<int>(
@@ -441,7 +469,6 @@ int main() {
                     cursorVisible = true;
                     lastBlink = chrono::steady_clock::now();
 
-                    // Keep following the prompt only when already at the bottom.
                     if (wasAtBottom) {
                         scrollToBottom(terminal);
                     }
