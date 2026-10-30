@@ -236,8 +236,6 @@ int main() {
     };
 
     while (true) {
-        std::cout << "user@terminator> " << std::flush;
-
         if (!lineEditor.readCommandLine(history, line)) {
             break;
         }

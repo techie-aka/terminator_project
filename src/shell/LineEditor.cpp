@@ -288,6 +288,8 @@ bool LineEditor::readCommandLine(
         std::cout << std::flush;
     };
 
+    std::cout << currentPrompt << std::flush;
+
     while (true) {
         char character = '\0';
 
