@@ -483,6 +483,13 @@ bool LineEditor::readCommandLine(
             continue;
         }
 
+        if (character == '\x0c') {
+            // Clear the screen and redraw the current editing line.
+            std::cout << "\033[2J\033[H" << std::flush;
+            redrawLine();
+            continue;
+        }
+
         // Insert printable ASCII characters at the current cursor position.
         if (character >= 32 && character <= 126) {
             physicalLine.insert(cursorPosition, 1, character);

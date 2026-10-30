@@ -1,3 +1,4 @@
+
 #ifndef INPUT_H
 #define INPUT_H
 
@@ -10,7 +11,9 @@ enum class InputAction {
     NextTab,
     PreviousTab,
     NewTab,
-    CloseTab
+    CloseTab,
+    CopySelection,
+    PasteClipboard
 };
 
 class Input {

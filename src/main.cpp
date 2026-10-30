@@ -3,6 +3,7 @@
 #include "input/Input.h"
 #include "terminal/TerminalConfig.h"
 #include "terminal/Terminal.h"
+#include "platform/Clipboard.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -13,14 +14,54 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <vector>
+#include <utility>
 
 using namespace std;
 
 bool cursorVisible = true;
 
+struct TextPosition {
+    int line = 0;
+    std::size_t column = 0;
+};
+
+struct TextSelection {
+    TextPosition anchor;
+    TextPosition focus;
+    bool dragging = false;
+};
+
 // State used while dragging the scrollbar thumb.
 bool draggingScrollbar = false;
 int dragOffsetY = 0;
+
+// Compare positions in terminal reading order.
+bool isPositionBefore(
+    const TextPosition& first,
+    const TextPosition& second
+) {
+    if (first.line != second.line) {
+        return first.line < second.line;
+    }
+
+    return first.column < second.column;
+}
+
+// Return selection endpoints in reading order.
+std::pair<TextPosition, TextPosition> getOrderedSelection(
+    const TextSelection& selection
+) {
+    if (isPositionBefore(selection.focus, selection.anchor)) {
+        return {selection.focus, selection.anchor};
+    }
+
+    return {selection.anchor, selection.focus};
+}
+
+bool hasTextSelection(const TextSelection& selection) {
+    return (selection.anchor.line != selection.focus.line ||
+            selection.anchor.column != selection.focus.column);
+}
 
 // Calculate the thumb height using the same formula as X11Window.
 int getThumbHeight(int totalLines, int visibleLines, int windowHeight) {
@@ -95,11 +136,136 @@ void drawTabs(X11Window& window,
     }
 }
 
+void clearSelection(TextSelection& selection, bool& draggingScrollbar) {
+    selection.anchor = {};
+    selection.focus = {};
+    selection.dragging = false;
+    draggingScrollbar = false;
+}
+
+TextPosition getTextPositionAt(
+    X11Window& window,
+    const Terminal& terminal,
+    int mouseX,
+    int mouseY
+) {
+    const auto& lines = terminal.getBuffer().getLines();
+
+    if (lines.empty()) {
+        return {};
+    }
+
+    // Restrict selection to the terminal content area.
+    const int contentWidth =
+        WINDOW_WIDTH - window.getScrollbarWidth();
+
+    mouseX = std::clamp(mouseX, 0, contentWidth - 1);
+
+    // START_Y is the XDrawString baseline, not the top of the first row.
+    // Use the font ascent so the mouse hit area matches the rendered glyphs.
+    const int firstLineTop = START_Y - window.getFontAscent();
+    const int visibleRow = std::clamp(
+        (mouseY - firstLineTop) / LINE_HEIGHT,
+        0,
+        getVisibleLines() - 1
+    );
+
+    const int logicalLine = std::clamp(
+        terminal.getFirstVisibleLine() + visibleRow,
+        0,
+        static_cast<int>(lines.size()) - 1
+    );
+
+    // Convert horizontal pixels into the nearest character boundary.
+    const std::size_t column = window.getTextColumnAtX(
+        lines[logicalLine],
+        mouseX
+    );
+
+    return {
+        logicalLine,
+        column
+    };
+}
+
+std::string getSelectedText(
+    const Terminal& terminal,
+    const TextSelection& selection
+) {
+    if (!hasTextSelection(selection)) {
+        return "";
+    }
+
+    const auto& lines = terminal.getBuffer().getLines();
+
+    const auto [start, end] = getOrderedSelection(selection);
+
+    std::string result;
+
+    for (int lineIndex = start.line;
+         lineIndex <= end.line;
+         ++lineIndex) {
+
+        if (lineIndex < 0 ||
+            lineIndex >= static_cast<int>(lines.size())) {
+            break;
+        }
+
+        const std::string& currentLine = lines[lineIndex];
+
+        if (start.line == end.line) {
+            // Selection is entirely within one line.
+            const std::size_t begin = std::min(
+                start.column, currentLine.size()
+            );
+
+            const std::size_t finish = std::min(
+                end.column, currentLine.size()
+            );
+
+            if (finish > begin) {
+                result += currentLine.substr(
+                    begin, finish - begin
+                );
+            }
+
+            break;
+        }
+
+        if (lineIndex == start.line) {
+            // First line: from the starting column to its end.
+            const std::size_t begin = std::min(
+                start.column, currentLine.size()
+            );
+
+            result += currentLine.substr(begin);
+        } else if (lineIndex == end.line) {
+            // Final line: from the beginning to the ending column.
+            const std::size_t finish = std::min(
+                end.column, currentLine.size()
+            );
+
+            result += currentLine.substr(0, finish);
+        } else {
+            // Intermediate lines are copied completely.
+            result += currentLine;
+        }
+
+        // Preserve line boundaries in the copied text.
+        if (lineIndex < end.line) {
+            result += '\n';
+        }
+    }
+
+    return result;
+}
+
 // Draw the active terminal's own buffer and scrollbar position.
 void drawTerminal(X11Window& window,
                   const Terminal& terminal,
                   const vector<unique_ptr<Terminal>>& terminals,
-                  int activeTab) {
+                  int activeTab,
+                const TextSelection& selection) {
     window.clear();
 
     drawTabs(window, terminals, activeTab);
@@ -121,7 +287,48 @@ void drawTerminal(X11Window& window,
 
     // Draw only the lines inside this terminal's viewport.
     for (int line = firstVisibleLine; line < lastVisibleLine; ++line) {
-        window.drawText(lines[line], 0, y);
+
+        // Draw this line with selection highlighting when it intersects
+        // the selected range.
+        if (hasTextSelection(selection)) {
+            const auto [selectionStart, selectionEnd] =
+                getOrderedSelection(selection);
+
+            if (line >= selectionStart.line &&
+                line <= selectionEnd.line) {
+
+                std::size_t highlightStart = 0;
+                std::size_t highlightEnd = lines[line].size();
+
+                if (line == selectionStart.line) {
+                    highlightStart = selectionStart.column;
+                }
+
+                if (line == selectionEnd.line) {
+                    highlightEnd = selectionEnd.column;
+                }
+
+                highlightStart = std::min(
+                    highlightStart, lines[line].size()
+                );
+
+                highlightEnd = std::min(
+                    highlightEnd, lines[line].size()
+                );
+
+                window.drawTextWithSelection(
+                    lines[line],
+                    0,
+                    y,
+                    highlightStart,
+                    highlightEnd
+                );
+            } else {
+                window.drawText(lines[line], 0, y);
+            }
+        } else {
+            window.drawText(lines[line], 0, y);
+        }
 
         // Show the cursor at the current end of the terminal buffer.
         if (cursorVisible && line == totalLines - 1) {
@@ -156,6 +363,8 @@ int main() {
     vector<unique_ptr<Terminal>> terminals;
     int activeTab = 0;
 
+    TextSelection selection;
+
     // Each tab creates and owns an independent Bash process and buffer.
     auto createTab = [&]() -> bool {
         auto terminal = make_unique<Terminal>();
@@ -167,6 +376,9 @@ int main() {
 
         terminals.push_back(move(terminal));
         activeTab = static_cast<int>(terminals.size()) - 1;
+
+        // A selection belongs to the tab where it was made.
+        clearSelection(selection, draggingScrollbar);
 
         scrollToBottom(*terminals[activeTab]);
 
@@ -196,7 +408,7 @@ int main() {
             );
         }
 
-        draggingScrollbar = false;
+        clearSelection(selection, draggingScrollbar);
         cursorVisible = true;
 
         return true;
@@ -213,6 +425,10 @@ int main() {
 
     Display* display = window.getDisplay();
     const int xConnection = ConnectionNumber(display);
+
+    // Manage X11 clipboard ownership and asynchronous paste requests.
+    Clipboard clipboard(display, window.getWindow());
+
     XEvent event;
 
     auto lastBlink = chrono::steady_clock::now();
@@ -275,6 +491,26 @@ int main() {
         while (XPending(display) > 0) {
             XNextEvent(display, &event);
 
+            // Clipboard operations use asynchronous X11 selection events.
+            // Process them before the ordinary mouse/keyboard event handling.
+            if (clipboard.handleEvent(event)) {
+                std::string pastedText;
+
+                if (clipboard.takePastedText(pastedText)) {
+                    if (!pastedText.empty() && !terminals.empty()) {
+                        // Send the pasted data to the currently active tab's PTY.
+                        terminals[activeTab]->sendInput(pastedText);
+
+                        cursorVisible = true;
+                        lastBlink = chrono::steady_clock::now();
+
+                        redraw = true;
+                    }
+                }
+
+                continue;
+            }
+
             if (event.type == Expose) {
                 redraw = true;
             } else if (event.type == ButtonPress) {
@@ -284,6 +520,7 @@ int main() {
 
                 const int visibleLines = getVisibleLines();
                 const int maxFirstLine = max(0, totalLines - visibleLines);
+                const int terminalContentTop = START_Y - window.getFontAscent();
 
                 // Mouse-wheel up moves toward older lines.
                 if (event.xbutton.button == Button4) {
@@ -307,7 +544,7 @@ int main() {
                     const int availableWidth = WINDOW_WIDTH - window.getScrollbarWidth();
 
                     // A click in the tab-bar area selects or closes a tab.
-                    if (event.xbutton.y < START_Y &&
+                    if (event.xbutton.y < terminalContentTop &&
                         event.xbutton.x >= 0 &&
                         event.xbutton.x < availableWidth) {
 
@@ -331,7 +568,7 @@ int main() {
                                 activeTab = clickedTab;
                             }
 
-                            draggingScrollbar = false;
+                            clearSelection(selection, draggingScrollbar);
                             cursorVisible = true;
                             redraw = true;
                         }
@@ -367,33 +604,67 @@ int main() {
                         }
 
                         redraw = true;
+                    } else if (event.xbutton.y >= terminalContentTop &&
+                               event.xbutton.x < barX) {
+                        // Begin a normal left-button text drag. X11 is configured
+                        // for Button1MotionMask, so no explicit pointer grab is needed.
+                        Terminal& terminal = *terminals[activeTab];
+
+                        selection.anchor = getTextPositionAt(
+                            window,
+                            terminal,
+                            event.xbutton.x,
+                            event.xbutton.y
+                        );
+
+                        selection.focus = selection.anchor;
+                        selection.dragging = true;
+                        draggingScrollbar = false;
+
+                        redraw = true;
                     }
                 }
-            } else if (event.type == MotionNotify && draggingScrollbar) {
-                Terminal& terminal = *terminals[activeTab];
+            } else if (event.type == MotionNotify) {
+                if (draggingScrollbar) {
+                    Terminal& terminal = *terminals[activeTab];
 
-                const int totalLines = static_cast<int>(
-                    terminal.getBuffer().getLines().size()
-                );
+                    const int totalLines = static_cast<int>(
+                        terminal.getBuffer().getLines().size()
+                    );
 
-                const int visibleLines = getVisibleLines();
-                const int thumbHeight = getThumbHeight(
-                    totalLines, visibleLines, WINDOW_HEIGHT
-                );
+                    const int visibleLines = getVisibleLines();
+                    const int thumbHeight = getThumbHeight(
+                        totalLines, visibleLines, WINDOW_HEIGHT
+                    );
 
-                // Dragging updates the viewport continuously.
-                terminal.setFirstVisibleLine(
-                    getFirstLineFromThumbY(
-                        event.xmotion.y - dragOffsetY,
-                        totalLines, visibleLines, WINDOW_HEIGHT, thumbHeight
-                    )
-                );
+                    // Dragging updates the viewport continuously.
+                    terminal.setFirstVisibleLine(
+                        getFirstLineFromThumbY(
+                            event.xmotion.y - dragOffsetY,
+                            totalLines, visibleLines,
+                            WINDOW_HEIGHT, thumbHeight
+                        )
+                    );
 
-                redraw = true;
+                    redraw = true;
+                } else if (selection.dragging &&
+                           (event.xmotion.state & Button1Mask)) {
+                    // Extend the selection only while the left button is held.
+                    Terminal& terminal = *terminals[activeTab];
+
+                    selection.focus = getTextPositionAt(
+                        window,
+                        terminal,
+                        event.xmotion.x,
+                        event.xmotion.y
+                    );
+                    redraw = true;
+                }
             } else if (event.type == ButtonRelease) {
-                // Stop dragging when the mouse button is released.
                 if (event.xbutton.button == Button1) {
+                    // Keep the selected range visible after the drag ends.
                     draggingScrollbar = false;
+                    selection.dragging = false;
                 }
             } else if (event.type == KeyPress) {
 
@@ -422,7 +693,7 @@ int main() {
                             activeTab = (activeTab + 1) %
                                 static_cast<int>(terminals.size());
 
-                            draggingScrollbar = false;
+                            clearSelection(selection, draggingScrollbar);
                             cursorVisible = true;
                             lastBlink = chrono::steady_clock::now();
 
@@ -437,12 +708,32 @@ int main() {
                                 (activeTab - 1 + static_cast<int>(terminals.size())) %
                                 static_cast<int>(terminals.size());
 
-                            draggingScrollbar = false;
+                            clearSelection(selection, draggingScrollbar);
                             cursorVisible = true;
                             lastBlink = chrono::steady_clock::now();
 
                             redraw = true;
                         }
+                        continue;
+
+                    case InputAction::CopySelection: {
+                        // Copy only when the user has selected a non-empty range.
+                        const Terminal& terminal = *terminals[activeTab];
+
+                        if (hasTextSelection(selection)) {
+                            const std::string selectedText =
+                                getSelectedText(terminal, selection);
+
+                            if (!clipboard.copy(selectedText)) {
+                                cerr << "Unable to acquire the X11 CLIPBOARD selection\n";
+                            }
+                        }
+                        continue;
+                    }
+
+                    case InputAction::PasteClipboard:
+                        // Clipboard contents arrive later through SelectionNotify.
+                        clipboard.requestPaste();
                         continue;
 
                     case InputAction::NoAction:
@@ -540,7 +831,11 @@ int main() {
 
         if (redraw) {
             drawTerminal(
-                window, *terminals[activeTab], terminals, activeTab
+                window,
+                *terminals[activeTab],
+                terminals,
+                activeTab,
+                selection
             );
 
             XFlush(display);

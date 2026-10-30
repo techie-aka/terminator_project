@@ -61,8 +61,18 @@ InputAction Input::getAction(XKeyEvent& keyEvent) const {
         return InputAction::NoAction;
     }
 
-    // Ctrl+Tab moves forward; Ctrl+Shift+Tab moves backward.
-    // Some X11 keyboard mappings report Shift+Tab as ISO_Left_Tab.
+    // Clipboard shortcuts must be detected before ordinary Ctrl+C.
+    if (shiftPressed &&
+        (keySymbol == XK_c || keySymbol == XK_C)) {
+        return InputAction::CopySelection;
+    }
+
+    if (shiftPressed &&
+        (keySymbol == XK_v || keySymbol == XK_V)) {
+        return InputAction::PasteClipboard;
+    }
+
+    // Ctrl+Tab and Ctrl+Shift+Tab.
     const bool isTabKey =
         keySymbol == XK_Tab ||
         keySymbol == XK_ISO_Left_Tab ||
@@ -178,6 +188,10 @@ string Input::translateKeyPress(XKeyEvent& keyEvent) {
             case XK_z:
             case XK_Z:
                 return "\x1a"; // Ctrl+Z
+
+            case XK_l:
+            case XK_L:
+                return "\x0c"; // Ctrl+L
 
             default:
                 break;

@@ -1,7 +1,9 @@
-
 #include "platform/X11Window.h"
 
+#include <X11/Xutil.h>
+
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 
 X11Window::X11Window(int width, int height)
@@ -67,10 +69,12 @@ bool X11Window::initialize() {
     }
 
     // Receive keyboard, mouse-wheel, scrollbar click, drag, and expose events.
+    // Button1MotionMask requests MotionNotify specifically while Button1
+    // (the left mouse button) is held. No explicit pointer grab is needed.
     XSelectInput(
         display, window,
         ExposureMask | KeyPressMask | ButtonPressMask |
-        ButtonReleaseMask | PointerMotionMask
+        ButtonReleaseMask | Button1MotionMask | PropertyChangeMask
     );
 
     // Use the same font for drawing and measuring.
@@ -101,13 +105,70 @@ void X11Window::drawText(const std::string& text, int x, int y) {
         return;
     }
 
+    GC gc = DefaultGC(display, screen);
+
     // Restore black foreground because scrollbar drawing changes the GC color.
-    XSetForeground(display, DefaultGC(display, screen), BlackPixel(display, screen));
+    XSetForeground(display, gc, BlackPixel(display, screen));
 
     XDrawString(
-        display, window, DefaultGC(display, screen),
+        display, window, gc,
         x, y, text.c_str(), static_cast<int>(text.length())
     );
+}
+
+void X11Window::drawTextWithSelection(
+    const std::string& text,
+    int x,
+    int y,
+    std::size_t selectionStart,
+    std::size_t selectionEnd
+) {
+    if (display == nullptr || window == 0 || font == nullptr) {
+        return;
+    }
+
+    selectionStart = std::min(selectionStart, text.size());
+    selectionEnd = std::min(selectionEnd, text.size());
+
+    if (selectionStart >= selectionEnd) {
+        drawText(text, x, y);
+        return;
+    }
+
+    const std::string prefix = text.substr(0, selectionStart);
+    const std::string selectedText =
+        text.substr(selectionStart, selectionEnd - selectionStart);
+    const std::string suffix = text.substr(selectionEnd);
+
+    const int selectedX = x + getTextWidth(prefix);
+    const int selectedWidth = getTextWidth(selectedText);
+
+    GC gc = DefaultGC(display, screen);
+
+    // Draw the unselected prefix normally.
+    drawText(prefix, x, y);
+
+    if (!selectedText.empty() && selectedWidth > 0) {
+        // Black rectangle forms the selection background.
+        XSetForeground(display, gc, BlackPixel(display, screen));
+
+        XFillRectangle(display, window, gc,
+            selectedX, y - font->ascent,
+            static_cast<unsigned int>(selectedWidth),
+            static_cast<unsigned int>(font->ascent + font->descent)
+        );
+
+        // Draw selected characters in white.
+        XSetForeground(display, gc, WhitePixel(display, screen));
+
+        XDrawString(display, window, gc, selectedX,
+            y, selectedText.c_str(),
+            static_cast<int>(selectedText.length())
+        );
+    }
+
+    // Draw the remaining suffix normally.
+    drawText(suffix, selectedX + selectedWidth, y);
 }
 
 int X11Window::getTextWidth(const std::string& text) {
@@ -118,11 +179,48 @@ int X11Window::getTextWidth(const std::string& text) {
     return XTextWidth(font, text.c_str(), static_cast<int>(text.length()));
 }
 
+std::size_t X11Window::getTextColumnAtX(
+    const std::string& text,
+    int pixelX
+) {
+    if (pixelX <= 0 || text.empty()) {
+        return 0;
+    }
+
+    std::size_t bestColumn = 0;
+    int bestDistance = std::abs(pixelX);
+
+    for (std::size_t column = 1; column <= text.size(); ++column) {
+        const int boundary = getTextWidth(text.substr(0, column));
+        const int distance = std::abs(pixelX - boundary);
+
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestColumn = column;
+        }
+
+        // Character boundaries are ordered from left to right.
+        if (boundary > pixelX && distance > bestDistance) {
+            break;
+        }
+    }
+
+    return bestColumn;
+}
+
+int X11Window::getFontAscent() const {
+    return font == nullptr ? 0 : font->ascent;
+}
+
 int X11Window::getScrollbarWidth() const {
     return 12;
 }
 
-void X11Window::drawScrollbar(int totalLines, int visibleLines, int firstVisibleLine) {
+void X11Window::drawScrollbar(
+    int totalLines,
+    int visibleLines,
+    int firstVisibleLine
+) {
     if (display == nullptr || window == 0 || totalLines <= 0) {
         return;
     }
@@ -131,12 +229,12 @@ void X11Window::drawScrollbar(int totalLines, int visibleLines, int firstVisible
     const int barX = width - barWidth;
     const int trackHeight = height;
 
-    // Draw the scrollbar track.
-    XSetForeground(display, DefaultGC(display, screen), WhitePixel(display, screen));
-    XFillRectangle(display, window, DefaultGC(display, screen),
-                   barX, 0, barWidth, trackHeight);
+    GC gc = DefaultGC(display, screen);
 
-    // Calculate the thumb height based on the visible content.
+    // Draw the scrollbar track.
+    XSetForeground(display, gc, WhitePixel(display, screen));
+    XFillRectangle(display, window, gc, barX, 0, barWidth, trackHeight);
+
     int thumbHeight = std::max(
         20, trackHeight * std::min(visibleLines, totalLines) / totalLines
     );
@@ -153,9 +251,12 @@ void X11Window::drawScrollbar(int totalLines, int visibleLines, int firstVisible
     }
 
     // Draw the scrollbar thumb.
-    XSetForeground(display, DefaultGC(display, screen), BlackPixel(display, screen));
-    XFillRectangle(display, window, DefaultGC(display, screen),
-                   barX + 2, thumbY, barWidth - 4, thumbHeight);
+    XSetForeground(display, gc, BlackPixel(display, screen));
+
+    XFillRectangle(
+        display, window, gc, barX + 2, thumbY,
+        barWidth - 4, thumbHeight
+    );
 }
 
 Display* X11Window::getDisplay() {
