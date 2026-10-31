@@ -8,6 +8,7 @@
 #include "shell/Redirection.h"
 #include "shell/LineEditor.h"
 #include "shell/MultiWatch.h"
+#include "shell/SignalControl.h"
 
 #include <csignal>
 #include <functional>
@@ -27,6 +28,11 @@ int main() {
     std::signal(SIGTSTP, SIG_IGN);
     std::signal(SIGTTIN, SIG_IGN);
     std::signal(SIGTTOU, SIG_IGN);
+
+    if (!SignalControl::install()) {
+        std::cerr << "terminator: unable to install signal handlers\n";
+        return 1;
+    }
 
     CommandParser parser;
     CommandExecutor executor;

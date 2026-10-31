@@ -79,6 +79,12 @@ InputAction Input::getAction(XKeyEvent& keyEvent) const {
         return InputAction::Interrupt;
     }
 
+    // Ctrl+Z must be handled by the GUI as a signal request.
+    if (!shiftPressed &&
+        (keySymbol == XK_z || keySymbol == XK_Z)) {
+        return InputAction::Suspend;
+    }
+
     // Ctrl+Tab and Ctrl+Shift+Tab.
     const bool isTabKey =
         keySymbol == XK_Tab ||

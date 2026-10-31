@@ -739,19 +739,31 @@ int main() {
                         continue;
 
                     case InputAction::Interrupt: {
-                        // Signal the shell directly so a foreground shell built-in
-                        // such as multiWatch can observe Ctrl+C.
-                        // Also send the normal ETX byte through the PTY so foreground
+                        // Ask the shell to forward SIGINT to its foreground process group.
                         Terminal& terminal = *terminals[activeTab];
 
                         const pid_t shellPid = terminal.getSession().getPid();
 
                         if (shellPid > 0) {
-                            (void)kill(shellPid, SIGINT);
+                            (void)kill(shellPid, SIGUSR1);
                         }
 
-                        terminal.sendInput("\x03");
+                        // Do not send ETX through the PTY.
+                        redraw = true;
+                        continue;
+                    }
 
+                    case InputAction::Suspend: {
+                        // Ask the shell to forward SIGTSTP to its foreground process group.
+                        Terminal& terminal = *terminals[activeTab];
+
+                        const pid_t shellPid = terminal.getSession().getPid();
+
+                        if (shellPid > 0) {
+                            (void)kill(shellPid, SIGUSR2);
+                        }
+
+                        // Do not send the Ctrl+Z control byte through the PTY.
                         redraw = true;
                         continue;
                     }

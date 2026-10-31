@@ -1,8 +1,11 @@
+
 #include "shell/JobManager.h"
+#include "shell/SignalControl.h"
 
 #include <cerrno>
 #include <csignal>
 #include <ostream>
+
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -138,11 +141,27 @@ bool JobManager::foreground(int id, int& exitStatus) {
         return false;
     }
 
+    /*
+     * The selected job becomes the foreground signal target.
+     *
+     * This is required because Ctrl+C and Ctrl+Z are delivered through
+     * the shell's SIGUSR1/SIGUSR2 notification handlers.
+     */
+    SignalControl::setForegroundProcessGroup(
+        job->processGroupId
+    );
+
     const pid_t shellProcessGroup = getpgrp();
     bool terminalHandedOver = false;
 
+    // Give the job terminal ownership before resuming or waiting for it.
     if (isatty(STDIN_FILENO)) {
-        if (tcsetpgrp(STDIN_FILENO, job->processGroupId) == -1) {
+        if (tcsetpgrp(
+                STDIN_FILENO,
+                job->processGroupId
+            ) == -1) {
+
+            SignalControl::clearForegroundProcessGroup();
             return false;
         }
 
@@ -152,9 +171,15 @@ bool JobManager::foreground(int id, int& exitStatus) {
     // A stopped job must be resumed before waiting for it.
     if (job->state == JobState::Stopped) {
         if (kill(-job->processGroupId, SIGCONT) == -1) {
+
             if (terminalHandedOver) {
-                tcsetpgrp(STDIN_FILENO, shellProcessGroup);
+                (void)tcsetpgrp(
+                    STDIN_FILENO,
+                    shellProcessGroup
+                );
             }
+
+            SignalControl::clearForegroundProcessGroup();
 
             update();
             return false;
@@ -166,21 +191,41 @@ bool JobManager::foreground(int id, int& exitStatus) {
     int status = 0;
     pid_t result;
 
-    // WUNTRACED makes waitpid return if Ctrl+Z stops this process.
+    /*
+     * Wait for the job's representative process.
+     *
+     * WUNTRACED is important: it allows Ctrl+Z to return control
+     * to the shell when the foreground job is suspended.
+     */
     do {
-        result = waitpid(job->processId, &status, WUNTRACED);
+        result = waitpid(
+            job->processId,
+            &status,
+            WUNTRACED
+        );
     } while (result == -1 && errno == EINTR);
 
+    // Restore terminal ownership to the shell.
+    bool terminalRestoreFailed = false;
+
     if (terminalHandedOver) {
-        if (tcsetpgrp(STDIN_FILENO, shellProcessGroup) == -1) {
-            return false;
+        if (tcsetpgrp(
+                STDIN_FILENO,
+                shellProcessGroup
+            ) == -1) {
+
+            terminalRestoreFailed = true;
         }
     }
+
+    // The foreground job has returned control to the shell.
+    SignalControl::clearForegroundProcessGroup();
 
     if (result == -1) {
         return false;
     }
 
+    // Update the tracked job according to the final wait status.
     if (WIFEXITED(status)) {
         job->state = JobState::Done;
         job->exitStatus = WEXITSTATUS(status);
@@ -192,6 +237,10 @@ bool JobManager::foreground(int id, int& exitStatus) {
     } else if (WIFSTOPPED(status)) {
         job->state = JobState::Stopped;
         exitStatus = 128 + WSTOPSIG(status);
+    }
+
+    if (terminalRestoreFailed) {
+        return false;
     }
 
     return true;
@@ -210,6 +259,7 @@ bool JobManager::background(int id) {
         return false;
     }
 
+    // Resume a suspended process group without taking terminal ownership.
     if (job->state == JobState::Stopped) {
         if (kill(-job->processGroupId, SIGCONT) == -1) {
             return false;

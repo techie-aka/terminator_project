@@ -1,5 +1,7 @@
+
 #include "shell/CommandExecutor.h"
 #include "shell/Redirection.h"
+#include "shell/SignalControl.h"
 
 #include <cerrno>
 #include <csignal>
@@ -77,6 +79,7 @@ int CommandExecutor::execute(
     const RedirectionSpec* redirection,
     bool inheritProcessGroup
 ) const {
+
     if (startedProcess != nullptr) {
         *startedProcess = -1;
     }
@@ -121,6 +124,7 @@ int CommandExecutor::execute(
             F_SETFD,
             flags | FD_CLOEXEC
         ) == -1) {
+
         const int savedError = errno;
 
         close(execStatusPipe[0]);
@@ -131,6 +135,67 @@ int CommandExecutor::execute(
         return 1;
     }
 
+    /*
+     * Block GUI notification signals during foreground process creation.
+     *
+     * Otherwise Ctrl+Z could arrive after fork() but before the foreground
+     * process group is registered. Blocking makes the notification pending
+     * until the correct process group is available.
+     *
+     * MultiWatch and background commands do not need this tracking.
+     */
+    const bool trackForeground =
+        !background && !inheritProcessGroup;
+
+    sigset_t originalSignalMask{};
+    bool signalRequestsBlocked = false;
+
+    auto restoreSignalRequests = [&]() -> bool {
+        if (!signalRequestsBlocked) {
+            return true;
+        }
+
+        if (sigprocmask(
+                SIG_SETMASK,
+                &originalSignalMask,
+                nullptr
+            ) == -1) {
+
+            std::cerr << "terminator: sigprocmask: "
+                      << std::strerror(errno) << '\n';
+            return false;
+        }
+
+        signalRequestsBlocked = false;
+        return true;
+    };
+
+    if (trackForeground) {
+        sigset_t notificationSignals{};
+
+        sigemptyset(&notificationSignals);
+        sigaddset(&notificationSignals, SIGUSR1);
+        sigaddset(&notificationSignals, SIGUSR2);
+
+        if (sigprocmask(
+                SIG_BLOCK,
+                &notificationSignals,
+                &originalSignalMask
+            ) == -1) {
+
+            const int savedError = errno;
+
+            close(execStatusPipe[0]);
+            close(execStatusPipe[1]);
+
+            std::cerr << "terminator: sigprocmask: "
+                      << std::strerror(savedError) << '\n';
+            return 1;
+        }
+
+        signalRequestsBlocked = true;
+    }
+
     const pid_t childPid = fork();
 
     if (childPid == -1) {
@@ -138,6 +203,8 @@ int CommandExecutor::execute(
 
         close(execStatusPipe[0]);
         close(execStatusPipe[1]);
+
+        (void)restoreSignalRequests();
 
         std::cerr << "terminator: fork: "
                   << std::strerror(savedError) << '\n';
@@ -147,10 +214,29 @@ int CommandExecutor::execute(
     if (childPid == 0) {
         close(execStatusPipe[0]);
 
+        // The child must not inherit the shell's temporarily blocked
+        // GUI notification signals.
+        if (trackForeground &&
+            sigprocmask(
+                SIG_SETMASK,
+                &originalSignalMask,
+                nullptr
+            ) == -1) {
+
+            reportChildFailure(
+                execStatusPipe[1],
+                errno,
+                EXEC_FAILURE
+            );
+
+            _exit(126);
+        }
+
         // Give the external command its own process group.
         if (!inheritProcessGroup) {
             setpgid(0, 0);
         }
+
         // External programs must have ordinary signal behavior.
         std::signal(SIGINT, SIG_DFL);
         std::signal(SIGQUIT, SIG_DFL);
@@ -162,7 +248,11 @@ int CommandExecutor::execute(
         if (redirection != nullptr) {
             RedirectionFailure failure;
 
-            if (!Redirection::applyInChild(*redirection, failure)) {
+            if (!Redirection::applyInChild(
+                    *redirection,
+                    failure
+                )) {
+
                 reportChildFailure(
                     execStatusPipe[1],
                     failure.errorNumber,
@@ -177,14 +267,18 @@ int CommandExecutor::execute(
         execvp(argv[0], argv.data());
 
         // execvp() returns only if execution failed.
+        const int executionError = errno;
+
         reportChildFailure(
             execStatusPipe[1],
-            errno,
+            executionError,
             EXEC_FAILURE
         );
 
         _exit(
-            errno == ENOENT || errno == ENOTDIR ? 127 : 126
+            executionError == ENOENT || executionError == ENOTDIR
+                ? 127
+                : 126
         );
     }
 
@@ -194,10 +288,18 @@ int CommandExecutor::execute(
     if (!inheritProcessGroup) {
         setpgid(childPid, childPid);
     }
-    // Successful exec produces EOF on this pipe.
-    // Failures send a complete ChildSetupFailure structure.
+
+    /*
+     * Read the child setup status.
+     *
+     * Successful exec closes the status pipe because of FD_CLOEXEC.
+     * Failed setup writes a ChildSetupFailure structure.
+     */
     ChildSetupFailure childFailure{};
-    char* destination = reinterpret_cast<char*>(&childFailure);
+
+    char* destination =
+        reinterpret_cast<char*>(&childFailure);
+
     std::size_t bytesReceived = 0;
     bool statusReadFailed = false;
 
@@ -222,27 +324,46 @@ int CommandExecutor::execute(
 
     close(execStatusPipe[0]);
 
+    // Handle an error while reading the child setup status.
     if (statusReadFailed) {
         const int savedError = errno;
+
+        if (trackForeground) {
+            SignalControl::clearForegroundProcessGroup();
+        }
 
         (void)kill(childPid, SIGTERM);
 
         int ignoredStatus = 0;
         (void)waitForChild(childPid, ignoredStatus);
 
+        (void)restoreSignalRequests();
+
         std::cerr << "terminator: cannot read child setup status: "
                   << std::strerror(savedError) << '\n';
+
         return 1;
     }
 
+    // The child reported an execution or redirection failure.
     if (bytesReceived != 0) {
         int childStatus = 0;
 
         if (!waitForChild(childPid, childStatus)) {
+            const int savedError = errno;
+
+            (void)restoreSignalRequests();
+
             std::cerr << "terminator: waitpid: "
-                      << std::strerror(errno) << '\n';
+                      << std::strerror(savedError) << '\n';
             return 1;
         }
+
+        if (trackForeground) {
+            SignalControl::clearForegroundProcessGroup();
+        }
+
+        (void)restoreSignalRequests();
 
         if (bytesReceived != sizeof(childFailure)) {
             std::cerr << "terminator: incomplete child setup status\n";
@@ -251,6 +372,7 @@ int CommandExecutor::execute(
 
         if (childFailure.kind == REDIRECTION_FAILURE) {
             RedirectionFailure failure;
+
             failure.errorNumber = childFailure.errorNumber;
             failure.input = childFailure.input;
 
@@ -266,51 +388,90 @@ int CommandExecutor::execute(
 
         if (childFailure.errorNumber == ENOENT ||
             childFailure.errorNumber == ENOTDIR) {
+
             std::cerr << "terminator: " << arguments[0]
                       << ": command not found\n";
             return 127;
         }
 
         std::cerr << "terminator: " << arguments[0]
-                  << ": " << std::strerror(childFailure.errorNumber)
+                  << ": "
+                  << std::strerror(childFailure.errorNumber)
                   << '\n';
+
         return 126;
     }
 
-    // Only successfully executed commands can be registered as jobs.
+    // The child successfully executed.
     if (startedProcess != nullptr) {
         *startedProcess = childPid;
     }
 
     if (startedProcessGroup != nullptr) {
-        *startedProcessGroup = inheritProcessGroup ? getpgrp() : childPid;
+        *startedProcessGroup =
+            inheritProcessGroup ? getpgrp() : childPid;
     }
 
+    // Background commands do not become the foreground signal target.
     if (background) {
         return 0;
+    }
+
+    /*
+     * Publish the foreground process group before unblocking notifications.
+     *
+     * Any Ctrl+C or Ctrl+Z received during process creation is now pending
+     * and will be forwarded to this process group when unblocked.
+     */
+    if (trackForeground) {
+        SignalControl::setForegroundProcessGroup(childPid);
+
+        if (!restoreSignalRequests()) {
+            SignalControl::clearForegroundProcessGroup();
+
+            (void)kill(-childPid, SIGTERM);
+
+            int ignoredStatus = 0;
+            (void)waitForChild(childPid, ignoredStatus);
+
+            return 1;
+        }
     }
 
     // Give a foreground command access to the terminal.
     const pid_t shellProcessGroup = getpgrp();
     bool terminalHandedOver = false;
 
-    if (!inheritProcessGroup && isatty(STDIN_FILENO) &&
+    if (!inheritProcessGroup &&
+        isatty(STDIN_FILENO) &&
         tcsetpgrp(STDIN_FILENO, childPid) == 0) {
+
         terminalHandedOver = true;
     }
 
     int status = 0;
     pid_t waitResult;
 
+    // WUNTRACED makes waitpid return when Ctrl+Z stops the command.
     do {
-        waitResult = waitpid(childPid, &status, WUNTRACED);
+        waitResult = waitpid(
+            childPid,
+            &status,
+            WUNTRACED
+        );
     } while (waitResult == -1 && errno == EINTR);
 
     // Restore the shell's terminal ownership.
     if (terminalHandedOver &&
         tcsetpgrp(STDIN_FILENO, shellProcessGroup) == -1) {
+
         std::cerr << "terminator: tcsetpgrp: "
                   << std::strerror(errno) << '\n';
+    }
+
+    // The foreground command has returned control to the shell.
+    if (trackForeground) {
+        SignalControl::clearForegroundProcessGroup();
     }
 
     if (waitResult == -1) {

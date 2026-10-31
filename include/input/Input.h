@@ -14,7 +14,8 @@ enum class InputAction {
     CloseTab,
     CopySelection,
     PasteClipboard,
-    Interrupt
+    Interrupt,
+    Suspend
 };
 
 class Input {

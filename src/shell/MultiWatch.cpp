@@ -162,7 +162,7 @@ int runOneCommand(
     if (commands.size() == 1) {
         CommandExecutor executor;
 
-        executor.execute(
+        return executor.execute(
             commands[0].arguments,
             false,
             nullptr,
