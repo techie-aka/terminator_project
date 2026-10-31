@@ -13,7 +13,8 @@ enum class InputAction {
     NewTab,
     CloseTab,
     CopySelection,
-    PasteClipboard
+    PasteClipboard,
+    Interrupt
 };
 
 class Input {

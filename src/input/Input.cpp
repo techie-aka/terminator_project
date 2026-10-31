@@ -72,6 +72,13 @@ InputAction Input::getAction(XKeyEvent& keyEvent) const {
         return InputAction::PasteClipboard;
     }
 
+    // Ctrl+C must reach the GUI so it can interrupt a foreground
+    // multiWatch built-in while preserving normal PTY Ctrl+C behaviour.
+    if (!shiftPressed &&
+        (keySymbol == XK_c || keySymbol == XK_C)) {
+        return InputAction::Interrupt;
+    }
+
     // Ctrl+Tab and Ctrl+Shift+Tab.
     const bool isTabKey =
         keySymbol == XK_Tab ||

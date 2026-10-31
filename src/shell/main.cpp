@@ -7,6 +7,7 @@
 #include "shell/CommandSubstitution.h"
 #include "shell/Redirection.h"
 #include "shell/LineEditor.h"
+#include "shell/MultiWatch.h"
 
 #include <csignal>
 #include <functional>
@@ -35,6 +36,7 @@ int main() {
     PipelineExecutor pipelineExecutor;
     CommandSubstitution commandSubstitution;
     LineEditor lineEditor;
+    MultiWatch multiWatch;
 
     if (!history.isReady()) {
         std::cerr << "terminator: shared history is unavailable\n";
@@ -48,6 +50,33 @@ int main() {
     std::function<int(const std::string&)> executeLine;
 
     executeLine = [&](const std::string& commandLine) -> int {
+
+        // Handle multiWatch before command substitution and normal parsing.
+        // Its quoted command-list syntax must remain intact.
+        if (MultiWatch::isInvocation(commandLine)) {
+            std::vector<std::string> monitoredCommands;
+            std::string multiWatchError;
+
+            if (!MultiWatch::parseInvocation(
+                    commandLine,
+                    monitoredCommands,
+                    multiWatchError)) {
+                std::cerr << "terminator: multiWatch: "
+                        << multiWatchError << '\n';
+
+                lastExitStatus = 2;
+                return lastExitStatus;
+            }
+
+            lastExitStatus = multiWatch.execute(
+                monitoredCommands,
+                lastExitStatus
+            );
+
+            return lastExitStatus;
+        }
+
+
         // First expand command substitutions. A pipe produced inside a
         // substitution must not accidentally become an outer pipeline.
         std::string commandToParse;

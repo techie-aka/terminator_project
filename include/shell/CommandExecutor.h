@@ -15,7 +15,8 @@ public:
         pid_t* startedProcess = nullptr,
         pid_t* startedProcessGroup = nullptr,
         bool* processStopped = nullptr,
-        const RedirectionSpec* redirection = nullptr
+        const RedirectionSpec* redirection = nullptr,
+        bool inheritProcessGroup = false
     ) const;
 };
 

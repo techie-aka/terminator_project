@@ -16,6 +16,8 @@
 #include <vector>
 #include <utility>
 
+#include <csignal>
+
 using namespace std;
 
 bool cursorVisible = true;
@@ -735,6 +737,24 @@ int main() {
                         // Clipboard contents arrive later through SelectionNotify.
                         clipboard.requestPaste();
                         continue;
+
+                    case InputAction::Interrupt: {
+                        // Signal the shell directly so a foreground shell built-in
+                        // such as multiWatch can observe Ctrl+C.
+                        // Also send the normal ETX byte through the PTY so foreground
+                        Terminal& terminal = *terminals[activeTab];
+
+                        const pid_t shellPid = terminal.getSession().getPid();
+
+                        if (shellPid > 0) {
+                            (void)kill(shellPid, SIGINT);
+                        }
+
+                        terminal.sendInput("\x03");
+
+                        redraw = true;
+                        continue;
+                    }
 
                     case InputAction::NoAction:
                         break;

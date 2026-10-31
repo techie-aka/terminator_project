@@ -74,7 +74,8 @@ int CommandExecutor::execute(
     pid_t* startedProcess,
     pid_t* startedProcessGroup,
     bool* processStopped,
-    const RedirectionSpec* redirection
+    const RedirectionSpec* redirection,
+    bool inheritProcessGroup
 ) const {
     if (startedProcess != nullptr) {
         *startedProcess = -1;
@@ -147,8 +148,9 @@ int CommandExecutor::execute(
         close(execStatusPipe[0]);
 
         // Give the external command its own process group.
-        (void)setpgid(0, 0);
-
+        if (!inheritProcessGroup) {
+            setpgid(0, 0);
+        }
         // External programs must have ordinary signal behavior.
         std::signal(SIGINT, SIG_DFL);
         std::signal(SIGQUIT, SIG_DFL);
@@ -189,8 +191,9 @@ int CommandExecutor::execute(
     close(execStatusPipe[1]);
 
     // Establish the process group from the parent side too.
-    (void)setpgid(childPid, childPid);
-
+    if (!inheritProcessGroup) {
+        setpgid(childPid, childPid);
+    }
     // Successful exec produces EOF on this pipe.
     // Failures send a complete ChildSetupFailure structure.
     ChildSetupFailure childFailure{};
@@ -280,7 +283,7 @@ int CommandExecutor::execute(
     }
 
     if (startedProcessGroup != nullptr) {
-        *startedProcessGroup = childPid;
+        *startedProcessGroup = inheritProcessGroup ? getpgrp() : childPid;
     }
 
     if (background) {
@@ -291,7 +294,7 @@ int CommandExecutor::execute(
     const pid_t shellProcessGroup = getpgrp();
     bool terminalHandedOver = false;
 
-    if (isatty(STDIN_FILENO) &&
+    if (!inheritProcessGroup && isatty(STDIN_FILENO) &&
         tcsetpgrp(STDIN_FILENO, childPid) == 0) {
         terminalHandedOver = true;
     }
