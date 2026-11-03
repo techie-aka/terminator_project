@@ -76,7 +76,7 @@ int getThumbHeight(int totalLines, int visibleLines, int windowHeight) {
 
     return min(
         windowHeight,
-        max(20, windowHeight * min(visibleLines, totalLines) / totalLines)
+        max(24, windowHeight * min(visibleLines, totalLines) / totalLines)
     );
 }
 
@@ -95,50 +95,145 @@ int getFirstLineFromThumbY(int thumbY, int totalLines, int visibleLines,
     return thumbY * maxFirstLine / maxThumbY;
 }
 
-int getVisibleLines() {
-    return max(1, (WINDOW_HEIGHT - START_Y) / LINE_HEIGHT);
+struct VisualRow {
+    int logicalLine = 0;
+    std::size_t startColumn = 0;
+    std::size_t endColumn = 0;
+    bool continuation = false;
+};
+
+constexpr int CONTENT_LEFT = 16;
+constexpr int CONTENT_RIGHT = 12;
+constexpr int TAB_BAR_HEIGHT = 44;
+const std::string CONTINUATION_MARKER = "> ";
+
+int getVisibleLines(const X11Window& window) {
+    const int firstLineTop = START_Y - window.getFontAscent();
+    const int usableHeight = window.getHeight() - firstLineTop - 8;
+    return max(1, usableHeight / LINE_HEIGHT);
 }
 
-// Keep the latest output visible when a terminal is created or submitted to.
-void scrollToBottom(Terminal& terminal) {
-    const int totalLines = static_cast<int>(
-        terminal.getBuffer().getLines().size()
+// Convert each logical buffer line into the rows that are actually visible.
+// The source buffer is never changed: wrapping is purely a rendering concern.
+std::vector<VisualRow> buildVisualRows(
+    X11Window& window,
+    const std::vector<std::string>& lines
+) {
+    std::vector<VisualRow> rows;
+
+    const int contentWidth = max(
+        1,
+        window.getWidth() - window.getScrollbarWidth() -
+        CONTENT_LEFT - CONTENT_RIGHT
+    );
+
+    for (int logicalLine = 0;
+         logicalLine < static_cast<int>(lines.size());
+         ++logicalLine) {
+
+        const std::string& line = lines[logicalLine];
+
+        if (line.empty()) {
+            rows.push_back({logicalLine, 0, 0, false});
+            continue;
+        }
+
+        std::size_t startColumn = 0;
+        bool continuation = false;
+
+        while (startColumn < line.size()) {
+            const int markerWidth = continuation
+                ? window.getTextWidth(CONTINUATION_MARKER) + 8
+                : 0;
+
+            const int availableWidth = max(1, contentWidth - markerWidth);
+
+            // Find the longest substring that fits in this visual row.
+            std::size_t low = startColumn + 1;
+            std::size_t high = line.size();
+            std::size_t best = startColumn + 1;
+
+            while (low <= high) {
+                const std::size_t middle = low + (high - low) / 2;
+                const std::string candidate = line.substr(
+                    startColumn, middle - startColumn
+                );
+
+                if (window.getTextWidth(candidate) <= availableWidth) {
+                    best = middle;
+                    low = middle + 1;
+                } else {
+                    if (middle == 0) {
+                        break;
+                    }
+                    high = middle - 1;
+                }
+            }
+
+            rows.push_back({
+                logicalLine,
+                startColumn,
+                best,
+                continuation
+            });
+
+            startColumn = best;
+            continuation = true;
+        }
+    }
+
+    return rows;
+}
+
+int getTextStartX(X11Window& window, const VisualRow& row) {
+    if (!row.continuation) {
+        return CONTENT_LEFT;
+    }
+
+    return CONTENT_LEFT + window.getTextWidth(CONTINUATION_MARKER) + 8;
+}
+
+// Keep the latest visual output visible when a tab is created or submitted to.
+void scrollToBottom(Terminal& terminal, X11Window& window) {
+    const auto rows = buildVisualRows(
+        window, terminal.getBuffer().getLines()
     );
 
     terminal.setFirstVisibleLine(
-        max(0, totalLines - getVisibleLines())
+        max(0, static_cast<int>(rows.size()) - getVisibleLines(window))
     );
 }
 
-// Draw a simple tab bar without adding tab-specific methods to X11Window yet.
-void drawTabs(X11Window& window,
-              const vector<unique_ptr<Terminal>>& terminals,
-              int activeTab) {
+void drawTabs(
+    X11Window& window,
+    const vector<unique_ptr<Terminal>>& terminals,
+    int activeTab
+) {
     const int tabCount = static_cast<int>(terminals.size());
 
     if (tabCount == 0) {
         return;
     }
 
-    const int availableWidth = WINDOW_WIDTH - window.getScrollbarWidth();
+    const int availableWidth = window.getWidth() - window.getScrollbarWidth();
     const int tabWidth = max(1, availableWidth / tabCount);
     const bool showCloseButtons = tabCount > 1;
 
     for (int i = 0; i < tabCount; ++i) {
         const int x = i * tabWidth;
-
-        const string label =
-            (i == activeTab ? "[*] bash " : "[ ] bash ") +
+        const string label = "bash  " +
             to_string(terminals[i]->getSession().getPid());
 
-        window.drawText(label, x + 5, 20);
-
-        // Show a close icon on every tab only when multiple tabs exist.
-        if (showCloseButtons) {
-            const int closeX = x + tabWidth - 18;
-            window.drawText("x", closeX, 20);
-        }
+        window.drawTab(
+            x,
+            tabWidth,
+            label,
+            i == activeTab,
+            showCloseButtons
+        );
     }
+
+    window.drawSeparator(TAB_BAR_HEIGHT);
 }
 
 void clearSelection(TextSelection& selection, bool& draggingScrollbar) {
@@ -154,42 +249,45 @@ TextPosition getTextPositionAt(
     int mouseX,
     int mouseY
 ) {
-    const auto& lines = terminal.getBuffer().getLines();
+    const auto rows = buildVisualRows(
+        window, terminal.getBuffer().getLines()
+    );
 
-    if (lines.empty()) {
+    if (rows.empty()) {
         return {};
     }
 
-    // Restrict selection to the terminal content area.
-    const int contentWidth =
-        WINDOW_WIDTH - window.getScrollbarWidth();
-
+    const int contentWidth = window.getWidth() - window.getScrollbarWidth();
     mouseX = std::clamp(mouseX, 0, contentWidth - 1);
 
-    // START_Y is the XDrawString baseline, not the top of the first row.
-    // Use the font ascent so the mouse hit area matches the rendered glyphs.
     const int firstLineTop = START_Y - window.getFontAscent();
     const int visibleRow = std::clamp(
         (mouseY - firstLineTop) / LINE_HEIGHT,
         0,
-        getVisibleLines() - 1
+        getVisibleLines(window) - 1
     );
 
-    const int logicalLine = std::clamp(
+    const int visualIndex = std::clamp(
         terminal.getFirstVisibleLine() + visibleRow,
         0,
-        static_cast<int>(lines.size()) - 1
+        static_cast<int>(rows.size()) - 1
     );
 
-    // Convert horizontal pixels into the nearest character boundary.
-    const std::size_t column = window.getTextColumnAtX(
-        lines[logicalLine],
-        mouseX
+    const VisualRow& row = rows[visualIndex];
+    const std::string& logicalText =
+        terminal.getBuffer().getLines()[row.logicalLine];
+    const std::string visibleText = logicalText.substr(
+        row.startColumn, row.endColumn - row.startColumn
     );
+
+    const int textStartX = getTextStartX(window, row);
+    const std::size_t localColumn = mouseX <= textStartX
+        ? 0
+        : window.getTextColumnAtX(visibleText, mouseX - textStartX);
 
     return {
-        logicalLine,
-        column
+        row.logicalLine,
+        min(row.endColumn, row.startColumn + localColumn)
     };
 }
 
@@ -265,94 +363,171 @@ std::string getSelectedText(
     return result;
 }
 
-// Draw the active terminal's own buffer and scrollbar position.
-void drawTerminal(X11Window& window,
-                  const Terminal& terminal,
-                  const vector<unique_ptr<Terminal>>& terminals,
-                  int activeTab,
-                const TextSelection& selection) {
-    window.clear();
+// Draw one visual row, highlighting the prompt separately from command text.
+void drawVisualText(
+    X11Window& window,
+    const std::string& logicalText,
+    const VisualRow& row,
+    int x,
+    int baseline
+) {
+    const std::string visibleText = logicalText.substr(
+        row.startColumn, row.endColumn - row.startColumn
+    );
 
+    if (row.continuation) {
+        window.drawText(
+            CONTINUATION_MARKER,
+            CONTENT_LEFT,
+            baseline,
+            TextStyle::Accent
+        );
+    }
+
+    if (row.startColumn == 0) {
+        const std::string prompts[] = {
+            "user@terminator> ",
+            "continuation> "
+        };
+
+        for (const std::string& prompt : prompts) {
+            if (logicalText.rfind(prompt, 0) == 0) {
+                const std::size_t promptLength = min(
+                    prompt.size(), visibleText.size()
+                );
+
+                window.drawText(
+                    visibleText.substr(0, promptLength),
+                    x,
+                    baseline,
+                    TextStyle::Prompt
+                );
+
+                window.drawText(
+                    visibleText.substr(promptLength),
+                    x + window.getTextWidth(visibleText.substr(0, promptLength)),
+                    baseline,
+                    TextStyle::Normal
+                );
+                return;
+            }
+        }
+    }
+
+    window.drawText(visibleText, x, baseline);
+}
+
+// Draw the active terminal's buffer using wrapped visual rows.
+void drawTerminal(
+    X11Window& window,
+    const Terminal& terminal,
+    const vector<unique_ptr<Terminal>>& terminals,
+    int activeTab,
+    const TextSelection& selection
+) {
+    window.clear();
     drawTabs(window, terminals, activeTab);
 
     const vector<string>& lines = terminal.getBuffer().getLines();
-    const int totalLines = static_cast<int>(lines.size());
-    const int visibleLines = getVisibleLines();
-    const int maxFirstLine = max(0, totalLines - visibleLines);
+    const vector<VisualRow> rows = buildVisualRows(window, lines);
+    const int totalRows = static_cast<int>(rows.size());
+    const int visibleRows = getVisibleLines(window);
+    const int maxFirstRow = max(0, totalRows - visibleRows);
 
-    const int firstVisibleLine = clamp(
-        terminal.getFirstVisibleLine(), 0, maxFirstLine
+    const int firstVisibleRow = clamp(
+        terminal.getFirstVisibleLine(), 0, maxFirstRow
+    );
+    const int lastVisibleRow = min(
+        totalRows, firstVisibleRow + visibleRows
     );
 
-    const int lastVisibleLine = min(
-        totalLines, firstVisibleLine + visibleLines
-    );
+    const auto [selectionStart, selectionEnd] =
+        getOrderedSelection(selection);
 
-    int y = START_Y;
+    for (int visualIndex = firstVisibleRow;
+         visualIndex < lastVisibleRow;
+         ++visualIndex) {
 
-    // Draw only the lines inside this terminal's viewport.
-    for (int line = firstVisibleLine; line < lastVisibleLine; ++line) {
+        const VisualRow& row = rows[visualIndex];
+        const string& logicalText = lines[row.logicalLine];
+        const int y = START_Y +
+            (visualIndex - firstVisibleRow) * LINE_HEIGHT;
+        const int textX = getTextStartX(window, row);
+        const string visibleText = logicalText.substr(
+            row.startColumn, row.endColumn - row.startColumn
+        );
 
-        // Draw this line with selection highlighting when it intersects
-        // the selected range.
-        if (hasTextSelection(selection)) {
-            const auto [selectionStart, selectionEnd] =
-                getOrderedSelection(selection);
+        bool selectedOnThisRow = false;
+        std::size_t selectedStart = row.startColumn;
+        std::size_t selectedEnd = row.endColumn;
 
-            if (line >= selectionStart.line &&
-                line <= selectionEnd.line) {
+        if (hasTextSelection(selection) &&
+            row.logicalLine >= selectionStart.line &&
+            row.logicalLine <= selectionEnd.line) {
 
-                std::size_t highlightStart = 0;
-                std::size_t highlightEnd = lines[line].size();
-
-                if (line == selectionStart.line) {
-                    highlightStart = selectionStart.column;
-                }
-
-                if (line == selectionEnd.line) {
-                    highlightEnd = selectionEnd.column;
-                }
-
-                highlightStart = std::min(
-                    highlightStart, lines[line].size()
-                );
-
-                highlightEnd = std::min(
-                    highlightEnd, lines[line].size()
-                );
-
-                window.drawTextWithSelection(
-                    lines[line],
-                    0,
-                    y,
-                    highlightStart,
-                    highlightEnd
-                );
-            } else {
-                window.drawText(lines[line], 0, y);
+            if (row.logicalLine == selectionStart.line) {
+                selectedStart = max(selectedStart, selectionStart.column);
             }
-        } else {
-            window.drawText(lines[line], 0, y);
+
+            if (row.logicalLine == selectionEnd.line) {
+                selectedEnd = min(selectedEnd, selectionEnd.column);
+            }
+
+            selectedStart = min(selectedStart, row.endColumn);
+            selectedEnd = max(selectedStart, min(selectedEnd, row.endColumn));
+            selectedOnThisRow = selectedStart < selectedEnd;
         }
 
-        // Show the cursor at the current end of the terminal buffer.
-        if (cursorVisible && line == totalLines - 1) {
-            const size_t cursorColumn = min(
-                terminal.getBuffer().getCursorColumn(),
-                lines[line].size()
+        if (selectedOnThisRow) {
+            window.drawTextWithSelection(
+                visibleText,
+                textX,
+                y,
+                selectedStart - row.startColumn,
+                selectedEnd - row.startColumn
             );
 
-            const string textBeforeCursor = lines[line].substr(0, cursorColumn);
-            const int cursorX = window.getTextWidth(textBeforeCursor);
-
-            window.drawText("_", cursorX, y);
+            if (row.continuation) {
+                window.drawText(
+                    CONTINUATION_MARKER,
+                    CONTENT_LEFT,
+                    y,
+                    TextStyle::Accent
+                );
+            }
+        } else {
+            drawVisualText(window, logicalText, row, textX, y);
         }
 
-        y += LINE_HEIGHT;
+        // Cursor column is stored against the original logical buffer line.
+        if (cursorVisible && row.logicalLine == static_cast<int>(lines.size()) - 1) {
+            const std::size_t cursorColumn = min(
+                terminal.getBuffer().getCursorColumn(), logicalText.size()
+            );
+
+            const bool lastVisualSegment =
+                visualIndex + 1 == totalRows ||
+                rows[visualIndex + 1].logicalLine != row.logicalLine;
+
+            const bool cursorBelongsHere =
+                cursorColumn >= row.startColumn &&
+                (cursorColumn < row.endColumn ||
+                 (lastVisualSegment && cursorColumn <= row.endColumn));
+
+            if (cursorBelongsHere) {
+                const std::string beforeCursor = logicalText.substr(
+                    row.startColumn, cursorColumn - row.startColumn
+                );
+
+                window.drawCursor(
+                    textX + window.getTextWidth(beforeCursor),
+                    y
+                );
+            }
+        }
     }
 
-    // Keep the scrollbar synchronized with this terminal's viewport.
-    window.drawScrollbar(totalLines, visibleLines, firstVisibleLine);
+    window.drawScrollbar(totalRows, visibleRows, firstVisibleRow);
 }
 
 int main(int argc, char* argv[]) {
@@ -411,7 +586,7 @@ int main(int argc, char* argv[]) {
         activeTab = static_cast<int>(terminals.size()) - 1;
 
         clearSelection(selection, draggingScrollbar);
-        scrollToBottom(*terminals[activeTab]);
+        scrollToBottom(*terminals[activeTab], window);
 
         return true;
     };
@@ -542,14 +717,21 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (event.type == Expose) {
+            if (event.type == ConfigureNotify) {
+                window.updateDimensions(
+                    event.xconfigure.width,
+                    event.xconfigure.height
+                );
+                redraw = true;
+            } else if (event.type == Expose) {
                 redraw = true;
             } else if (event.type == ButtonPress) {
-                const int totalLines = static_cast<int>(
-                    terminals[activeTab]->getBuffer().getLines().size()
-                );
+                const int totalLines = static_cast<int>(buildVisualRows(
+                    window,
+                    terminals[activeTab]->getBuffer().getLines()
+                ).size());
 
-                const int visibleLines = getVisibleLines();
+                const int visibleLines = getVisibleLines(window);
                 const int maxFirstLine = max(0, totalLines - visibleLines);
                 const int terminalContentTop = START_Y - window.getFontAscent();
 
@@ -571,8 +753,8 @@ int main(int argc, char* argv[]) {
 
                     redraw = true;
                 } else if (event.xbutton.button == Button1) {
-                    const int barX = WINDOW_WIDTH - window.getScrollbarWidth();
-                    const int availableWidth = WINDOW_WIDTH - window.getScrollbarWidth();
+                    const int barX = window.getWidth() - window.getScrollbarWidth();
+                    const int availableWidth = window.getWidth() - window.getScrollbarWidth();
 
                     // A click in the tab-bar area selects or closes a tab.
                     if (event.xbutton.y < terminalContentTop &&
@@ -607,10 +789,10 @@ int main(int argc, char* argv[]) {
                         Terminal& terminal = *terminals[activeTab];
 
                         const int thumbHeight = getThumbHeight(
-                            totalLines, visibleLines, WINDOW_HEIGHT
+                            totalLines, visibleLines, window.getHeight()
                         );
 
-                        const int maxThumbY = WINDOW_HEIGHT - thumbHeight;
+                        const int maxThumbY = window.getHeight() - thumbHeight;
                         const int currentThumbY = maxFirstLine == 0
                             ? 0
                             : maxThumbY * terminal.getFirstVisibleLine()
@@ -629,7 +811,7 @@ int main(int argc, char* argv[]) {
                             terminal.setFirstVisibleLine(
                                 getFirstLineFromThumbY(
                                     targetThumbY, totalLines, visibleLines,
-                                    WINDOW_HEIGHT, thumbHeight
+                                    window.getHeight(), thumbHeight
                                 )
                             );
                         }
@@ -659,13 +841,13 @@ int main(int argc, char* argv[]) {
                 if (draggingScrollbar) {
                     Terminal& terminal = *terminals[activeTab];
 
-                    const int totalLines = static_cast<int>(
-                        terminal.getBuffer().getLines().size()
-                    );
+                    const int totalLines = static_cast<int>(buildVisualRows(
+                        window, terminal.getBuffer().getLines()
+                    ).size());
 
-                    const int visibleLines = getVisibleLines();
+                    const int visibleLines = getVisibleLines(window);
                     const int thumbHeight = getThumbHeight(
-                        totalLines, visibleLines, WINDOW_HEIGHT
+                        totalLines, visibleLines, window.getHeight()
                     );
 
                     // Dragging updates the viewport continuously.
@@ -673,7 +855,7 @@ int main(int argc, char* argv[]) {
                         getFirstLineFromThumbY(
                             event.xmotion.y - dragOffsetY,
                             totalLines, visibleLines,
-                            WINDOW_HEIGHT, thumbHeight
+                            window.getHeight(), thumbHeight
                         )
                     );
 
@@ -793,13 +975,13 @@ int main(int argc, char* argv[]) {
                 // Forward ordinary keyboard input to the active shell.
                 Terminal& terminal = *terminals[activeTab];
 
-                const int oldTotalLines = static_cast<int>(
-                    terminal.getBuffer().getLines().size()
-                );
+                const int oldTotalLines = static_cast<int>(buildVisualRows(
+                    window, terminal.getBuffer().getLines()
+                ).size());
 
                 const bool wasAtBottom =
                     terminal.getFirstVisibleLine() >=
-                    max(0, oldTotalLines - getVisibleLines());
+                    max(0, oldTotalLines - getVisibleLines(window));
 
                 const string keyInput = input.translateKeyPress(event.xkey);
 
@@ -810,7 +992,7 @@ int main(int argc, char* argv[]) {
                     lastBlink = chrono::steady_clock::now();
 
                     if (wasAtBottom) {
-                        scrollToBottom(terminal);
+                        scrollToBottom(terminal, window);
                     }
 
                     redraw = true;
@@ -831,13 +1013,13 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                const int oldTotalLines = static_cast<int>(
-                    terminal.getBuffer().getLines().size()
-                );
+                const int oldTotalLines = static_cast<int>(buildVisualRows(
+                    window, terminal.getBuffer().getLines()
+                ).size());
 
                 const bool wasAtBottom =
                     terminal.getFirstVisibleLine() >=
-                    max(0, oldTotalLines - getVisibleLines());
+                    max(0, oldTotalLines - getVisibleLines(window));
 
                 // Read pending output. This may detect that the shell has exited.
                 if (terminal.receiveOutput()) {
@@ -852,7 +1034,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (wasAtBottom) {
-                    scrollToBottom(terminal);
+                    scrollToBottom(terminal, window);
                 }
 
                 redraw = true;

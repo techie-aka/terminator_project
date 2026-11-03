@@ -52,12 +52,7 @@ int Terminal::getFirstVisibleLine() const {
 }
 
 void Terminal::setFirstVisibleLine(int line) {
-    const int totalLines =
-        static_cast<int>(buffer.getLines().size());
-
-    firstVisibleLine = std::clamp(
-        line,
-        0,
-        std::max(0, totalLines - 1)
-    );
+    // The UI stores a visual-row offset here. One logical buffer line may
+    // occupy multiple visual rows when it reaches the right edge.
+    firstVisibleLine = std::max(0, line);
 }
