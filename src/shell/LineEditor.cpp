@@ -1,6 +1,7 @@
 
 #include "shell/LineEditor.h"
 #include "shell/History.h"
+#include "shell/SignalControl.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -11,6 +12,9 @@
 
 #include <termios.h>
 #include <unistd.h>
+
+#include "shell/ShellIO.h"
+#include <ostream>
 
 namespace {
 
@@ -160,15 +164,24 @@ InputStatus analyzeInput(const std::string& input) {
 }
 
 // Read one byte, retrying if the system call is interrupted.
-bool readByte(char& byte) {
+bool readByte(int inputFd, char& byte) {
     while (true) {
-        const ssize_t count = ::read(STDIN_FILENO, &byte, 1);
+        const ssize_t count = ::read(inputFd, &byte, 1);
 
         if (count == 1) {
             return true;
         }
 
         if (count == -1 && errno == EINTR) {
+
+            // A process-backed shell may receive SIGHUP or SIGTERM
+            // while waiting for user input.
+            //
+            // In that case, stop reading instead of retrying forever.
+            if (SignalControl::isShutdownRequested()) {
+                return false;
+            }
+
             continue;
         }
 
@@ -178,12 +191,12 @@ bool readByte(char& byte) {
 
 // Read complete CSI/SS3 sequences:
 // ESC [ D, ESC [ 3 ~, ESC O H, etc.
-bool readEscapeSequence(std::string& sequence) {
+bool readEscapeSequence(int inputFd, std::string& sequence) {
     sequence.clear();
 
     char introducer = '\0';
 
-    if (!readByte(introducer)) {
+    if (!readByte(inputFd, introducer)) {
         return false;
     }
 
@@ -191,7 +204,7 @@ bool readEscapeSequence(std::string& sequence) {
         while (sequence.size() < 16) {
             char c = '\0';
 
-            if (!readByte(c)) {
+            if (!readByte(inputFd, c)) {
                 return false;
             }
 
@@ -209,7 +222,7 @@ bool readEscapeSequence(std::string& sequence) {
     if (introducer == 'O') {
         char finalByte = '\0';
 
-        if (!readByte(finalByte)) {
+        if (!readByte(inputFd, finalByte)) {
             return false;
         }
 
@@ -223,32 +236,41 @@ bool readEscapeSequence(std::string& sequence) {
 
 } // namespace
 
-bool LineEditor::readCommandLine(
+namespace {
+
+bool readCommandLineFrom(
     const History& history,
-    std::string& line
+    std::string& line,
+    int inputFd,
+    std::ostream& output
 ) {
-    // Save the terminal settings so they can be restored after input.
+
+    const bool hasTerminal = isatty(inputFd) != 0;
+
     termios originalSettings{};
 
-    if (tcgetattr(STDIN_FILENO, &originalSettings) == -1) {
+    if (hasTerminal &&
+        tcgetattr(inputFd, &originalSettings) == -1) {
         return false;
     }
 
-    // Disable canonical input and automatic echo.
-    // We read and display every character ourselves.
-    termios settings = originalSettings;
-    settings.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
-    settings.c_cc[VMIN] = 1;
-    settings.c_cc[VTIME] = 0;
+    if (hasTerminal) {
+        termios settings = originalSettings;
 
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &settings) == -1) {
-        return false;
+        settings.c_lflag &=
+            static_cast<tcflag_t>(~(ICANON | ECHO));
+
+        settings.c_cc[VMIN] = 1;
+        settings.c_cc[VTIME] = 0;
+
+        if (tcsetattr(inputFd, TCSANOW, &settings) == -1) {
+            return false;
+        }
     }
 
     const auto restoreTerminal = [&]() {
-        return tcsetattr(
-            STDIN_FILENO, TCSANOW, &originalSettings
-        ) != -1;
+        return !hasTerminal ||
+            tcsetattr(inputFd, TCSANOW, &originalSettings) != -1;
     };
 
     // History navigation state.
@@ -277,23 +299,23 @@ bool LineEditor::readCommandLine(
     // Redraw the entire editable line and return the visual cursor
     // to its logical position using backspace characters.
     const auto redrawLine = [&]() {
-        std::cout << '\r' << "\033[K"
+        output << '\r' << "\033[K"
                   << currentPrompt << physicalLine;
 
         for (std::size_t i = cursorPosition;
              i < physicalLine.size(); ++i) {
-            std::cout << '\b';
+            output << '\b';
         }
 
-        std::cout << std::flush;
+        output << std::flush;
     };
 
-    std::cout << currentPrompt << std::flush;
+    output << currentPrompt << std::flush;
 
     while (true) {
         char character = '\0';
 
-        if (!readByte(character)) {
+        if (!readByte(inputFd, character)) {
             restoreTerminal();
             return false;
         }
@@ -302,7 +324,7 @@ bool LineEditor::readCommandLine(
         if (character == '\r' || character == '\n') {
             // Display the complete line before submitting it, even when
             // the cursor is currently somewhere in the middle.
-            std::cout << '\r' << "\033[K"
+            output << '\r' << "\033[K"
                       << currentPrompt << physicalLine
                       << '\n' << std::flush;
 
@@ -327,7 +349,7 @@ bool LineEditor::readCommandLine(
                 continuing = true;
                 currentPrompt = continuationPrompt;
 
-                std::cout << currentPrompt << std::flush;
+                output << currentPrompt << std::flush;
                 continue;
             }
 
@@ -335,7 +357,7 @@ bool LineEditor::readCommandLine(
                 continuing = true;
                 currentPrompt = continuationPrompt;
 
-                std::cout << currentPrompt << std::flush;
+                output << currentPrompt << std::flush;
                 continue;
             }
 
@@ -418,7 +440,7 @@ bool LineEditor::readCommandLine(
         if (character == '\x1b') {
             std::string sequence;
 
-            if (!readEscapeSequence(sequence)) {
+            if (!readEscapeSequence(inputFd, sequence)) {
                 continue;
             }
 
@@ -487,7 +509,7 @@ bool LineEditor::readCommandLine(
 
         if (character == '\x0c') {
             // Clear the screen and redraw the current editing line.
-            std::cout << "\033[2J\033[H" << std::flush;
+            output << "\033[2J\033[H" << std::flush;
             redrawLine();
             continue;
         }
@@ -505,4 +527,31 @@ bool LineEditor::readCommandLine(
     }
 
     return true;
+}
+}
+
+
+bool LineEditor::readCommandLine(
+    const History& history,
+    std::string& line
+) {
+    return readCommandLineFrom(
+        history,
+        line,
+        STDIN_FILENO,
+        std::cout
+    );
+}
+
+bool LineEditor::readCommandLine(
+    const History& history,
+    std::string& line,
+    ShellIO& io
+) {
+    return readCommandLineFrom(
+        history,
+        line,
+        io.getInputFd(),
+        io.out()
+    );
 }

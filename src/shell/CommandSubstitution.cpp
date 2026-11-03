@@ -1,13 +1,7 @@
 #include "shell/CommandSubstitution.h"
+#include "shell/ShellHelper.h"
 
-#include <cerrno>
-#include <cstdio>
-#include <iostream>
 #include <vector>
-
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 namespace {
 
@@ -214,83 +208,24 @@ std::size_t findMatchingBacktick(
     return std::string::npos;
 }
 
-// Execute a command callback in a child and capture its stdout through a pipe.
-// Stderr remains attached to the terminal, as it normally does for $(...).
+// Run the inner command in a separate shell process. This is important in
+// thread mode: we must not fork and then execute C++ shell code in the child
+// of the GUI process. The helper's stdout is captured; stderr stays in this tab.
 bool captureOutput(
     const std::string& command,
-    const CommandSubstitution::CommandRunner& runCommand,
     std::string& output,
-    std::string& errorMessage
+    std::string& errorMessage,
+    int errorFd,
+    ShellIO* owner
 ) {
-    int outputPipe[2];
-    if (::pipe(outputPipe) == -1) {
-        errorMessage = "pipe for command substitution failed";
-        return false;
-    }
-
-    // Avoid copying buffered prompt/output into the forked child.
-    std::cout.flush();
-
-    const pid_t childPid = ::fork();
-    if (childPid == -1) {
-        const int savedError = errno;
-        ::close(outputPipe[0]);
-        ::close(outputPipe[1]);
-        errno = savedError;
-        errorMessage = "fork for command substitution failed";
-        return false;
-    }
-
-    if (childPid == 0) {
-        ::close(outputPipe[0]);
-
-        if (::dup2(outputPipe[1], STDOUT_FILENO) == -1) {
-            std::perror("terminator: command substitution dup2");
-            ::close(outputPipe[1]);
-            _exit(126);
-        }
-        ::close(outputPipe[1]);
-
-        // Calling the shell callback allows nested substitutions and inner
-        // pipelines to reuse the shell's existing execution implementation.
-        const int status = runCommand(command);
-        std::cout.flush();
-        std::fflush(nullptr);
-        _exit(status & 0xff);
-    }
-
-    ::close(outputPipe[1]);
-
-    char buffer[4096];
-    bool readSucceeded = true;
-    while (true) {
-        const ssize_t bytesRead = ::read(outputPipe[0], buffer, sizeof(buffer));
-        if (bytesRead > 0) {
-            output.append(buffer, static_cast<std::size_t>(bytesRead));
-        } else if (bytesRead == 0) {
-            break;
-        } else if (errno == EINTR) {
-            continue;
-        } else {
-            errorMessage = "read from command-substitution pipe failed";
-            readSucceeded = false;
-            break;
-        }
-    }
-
-    ::close(outputPipe[0]);
-
-    int childStatus = 0;
-    while (::waitpid(childPid, &childStatus, 0) == -1) {
-        if (errno == EINTR) {
-            continue;
-        }
-        errorMessage = "waitpid for command substitution failed";
-        return false;
-    }
-
-    // A non-zero inner command status does not suppress its captured stdout.
-    return readSucceeded;
+    // Nested substitutions are handled by the helper shell's own execute path.
+    return ShellHelper::captureOutput(
+        command,
+        errorFd,
+        output,
+        errorMessage,
+        owner
+    );
 }
 
 // Keep substituted characters as argument data, not pipeline/background
@@ -333,17 +268,13 @@ void removeTrailingNewlines(std::string& output) {
 
 bool CommandSubstitution::expand(
     const std::string& input,
-    const CommandRunner& runCommand,
     std::string& expandedCommand,
-    std::string& errorMessage
+    std::string& errorMessage,
+    int errorFd,
+    ShellIO* owner
 ) const {
     expandedCommand.clear();
     errorMessage.clear();
-
-    if (!runCommand) {
-        errorMessage = "command substitution has no command runner";
-        return false;
-    }
 
     char quote = '\0';
     bool escaped = false;
@@ -402,7 +333,7 @@ bool CommandSubstitution::expand(
                 std::string capturedOutput;
 
                 if (!captureOutput(
-                        innerCommand, runCommand, capturedOutput, errorMessage)) {
+                        innerCommand, capturedOutput, errorMessage, errorFd, owner)) {
                     return false;
                 }
 
@@ -429,9 +360,10 @@ bool CommandSubstitution::expand(
 
                 if (!captureOutput(
                         innerCommand,
-                        runCommand,
                         capturedOutput,
-                        errorMessage)) {
+                        errorMessage,
+                        errorFd,
+                        owner)) {
                     return false;
                 }
 
@@ -475,7 +407,7 @@ bool CommandSubstitution::expand(
             std::string capturedOutput;
 
             if (!captureOutput(
-                    innerCommand, runCommand, capturedOutput, errorMessage)) {
+                    innerCommand, capturedOutput, errorMessage, errorFd, owner)) {
                 return false;
             }
 
@@ -502,9 +434,10 @@ bool CommandSubstitution::expand(
 
             if (!captureOutput(
                     innerCommand,
-                    runCommand,
                     capturedOutput,
-                    errorMessage)) {
+                    errorMessage,
+                    errorFd,
+                    owner)) {
                 return false;
             }
 

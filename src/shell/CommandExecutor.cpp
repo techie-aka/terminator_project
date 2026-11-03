@@ -15,6 +15,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "shell/ShellIO.h"
+
+#include <spawn.h>
+#include <signal.h>
+
+extern char** environ;
+
 namespace {
 
 constexpr int EXEC_FAILURE = 1;
@@ -68,6 +75,271 @@ bool waitForChild(pid_t pid, int& status) {
     }
 }
 
+class ScopedFd {
+public:
+    ScopedFd() = default;
+    explicit ScopedFd(int fd) : fd_(fd) {}
+    ~ScopedFd() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+
+    int get() const { return fd_; }
+    void reset(int fd) {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+        fd_ = fd;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+int executeWithShellIO(
+    const std::vector<std::string>& arguments,
+    bool background,
+    pid_t* startedProcess,
+    pid_t* startedProcessGroup,
+    bool* processStopped,
+    const RedirectionSpec* redirection,
+    bool inheritProcessGroup,
+    ShellIO& io
+) {
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+
+    for (const std::string& argument : arguments) {
+        argv.push_back(const_cast<char*>(argument.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    // Open redirections in the shell thread. This gives us an exact error
+    // message and avoids confusing a missing redirection file with ENOENT
+    // from posix_spawnp(command).
+    ScopedFd inputRedirect;
+    ScopedFd outputRedirect;
+
+    if (redirection != nullptr && redirection->hasInput) {
+        const int fd = open(
+            redirection->inputFile.c_str(),
+            O_RDONLY | O_CLOEXEC
+        );
+        if (fd == -1) {
+            io.err() << "terminator: input redirection: "
+                     << redirection->inputFile << ": "
+                     << std::strerror(errno) << '\n';
+            return 1;
+        }
+        inputRedirect.reset(fd);
+    }
+
+    if (redirection != nullptr && redirection->hasOutput) {
+        const int fd = open(
+            redirection->outputFile.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+            0644
+        );
+        if (fd == -1) {
+            io.err() << "terminator: output redirection: "
+                     << redirection->outputFile << ": "
+                     << std::strerror(errno) << '\n';
+            return 1;
+        }
+        outputRedirect.reset(fd);
+    }
+
+    posix_spawn_file_actions_t actions;
+    int result = posix_spawn_file_actions_init(&actions);
+    if (result != 0) {
+        io.err() << "terminator: spawn setup: "
+                 << std::strerror(result) << '\n';
+        return 1;
+    }
+
+    int setupError = 0;
+
+    auto addDup = [&](int source, int destination) {
+        if (setupError == 0 && source != destination) {
+            setupError = posix_spawn_file_actions_adddup2(
+                &actions, source, destination
+            );
+        }
+    };
+
+    auto addClose = [&](int fd) {
+        if (setupError == 0 && fd > STDERR_FILENO) {
+            setupError = posix_spawn_file_actions_addclose(&actions, fd);
+        }
+    };
+
+    // First connect the child to this tab's streams.
+    addDup(io.getInputFd(), STDIN_FILENO);
+    addDup(io.getOutputFd(), STDOUT_FILENO);
+    addDup(io.getErrorFd(), STDERR_FILENO);
+
+    // Then apply explicit redirection, which takes precedence over ShellIO.
+    if (inputRedirect.get() >= 0) {
+        addDup(inputRedirect.get(), STDIN_FILENO);
+    }
+    if (outputRedirect.get() >= 0) {
+        addDup(outputRedirect.get(), STDOUT_FILENO);
+    }
+
+    // The child only needs the duplicated standard descriptors.
+    const int ioDescriptors[] = {
+        io.getInputFd(), io.getOutputFd(), io.getErrorFd()
+    };
+    for (std::size_t i = 0; i < 3 && setupError == 0; ++i) {
+        const int fd = ioDescriptors[i];
+        if (fd <= STDERR_FILENO) {
+            continue;
+        }
+        bool duplicate = false;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (ioDescriptors[j] == fd) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            addClose(fd);
+        }
+    }
+    addClose(inputRedirect.get());
+    addClose(outputRedirect.get());
+
+    if (setupError != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        io.err() << "terminator: spawn file actions: "
+                 << std::strerror(setupError) << '\n';
+        return 1;
+    }
+
+    posix_spawnattr_t attributes;
+    result = posix_spawnattr_init(&attributes);
+    if (result != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        io.err() << "terminator: spawn attributes: "
+                 << std::strerror(result) << '\n';
+        return 1;
+    }
+
+    sigset_t defaultSignals;
+    sigset_t emptyMask;
+    sigemptyset(&defaultSignals);
+    sigaddset(&defaultSignals, SIGINT);
+    sigaddset(&defaultSignals, SIGQUIT);
+    sigaddset(&defaultSignals, SIGTSTP);
+    sigaddset(&defaultSignals, SIGTTIN);
+    sigaddset(&defaultSignals, SIGTTOU);
+    sigaddset(&defaultSignals, SIGPIPE);
+    sigemptyset(&emptyMask);
+
+    result = posix_spawnattr_setsigdefault(&attributes, &defaultSignals);
+    if (result == 0) {
+        result = posix_spawnattr_setsigmask(&attributes, &emptyMask);
+    }
+
+    short spawnFlags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
+    if (result == 0 && !inheritProcessGroup) {
+        result = posix_spawnattr_setpgroup(&attributes, 0);
+        spawnFlags = static_cast<short>(spawnFlags | POSIX_SPAWN_SETPGROUP);
+    }
+    if (result == 0) {
+        result = posix_spawnattr_setflags(&attributes, spawnFlags);
+    }
+
+    if (result != 0) {
+        posix_spawnattr_destroy(&attributes);
+        posix_spawn_file_actions_destroy(&actions);
+        io.err() << "terminator: spawn attributes: "
+                 << std::strerror(result) << '\n';
+        return 1;
+    }
+
+    pid_t childPid = -1;
+    result = posix_spawnp(
+        &childPid,
+        argv[0],
+        &actions,
+        &attributes,
+        argv.data(),
+        environ
+    );
+
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+
+    if (result != 0) {
+        if (result == ENOENT || result == ENOTDIR) {
+            io.err() << "terminator: " << arguments[0]
+                     << ": command not found\n";
+            return 127;
+        }
+        io.err() << "terminator: " << arguments[0]
+                 << ": " << std::strerror(result) << '\n';
+        return 126;
+    }
+
+    const pid_t childProcessGroup = inheritProcessGroup
+        ? getpgrp()
+        : childPid;
+
+    if (startedProcess != nullptr) {
+        *startedProcess = childPid;
+    }
+    if (startedProcessGroup != nullptr) {
+        *startedProcessGroup = childProcessGroup;
+    }
+
+    if (background) {
+        return 0;
+    }
+
+    // Do not publish the application's own process group as a tab's
+    // foreground target. Inherited groups are used by internal helpers;
+    // ordinary foreground commands always receive their own group.
+    const bool publishedForegroundGroup = !inheritProcessGroup;
+    if (publishedForegroundGroup) {
+        io.setForegroundProcessGroup(childProcessGroup);
+    }
+
+    int status = 0;
+    pid_t waitResult;
+    do {
+        waitResult = waitpid(childPid, &status, WUNTRACED);
+    } while (waitResult == -1 && errno == EINTR);
+
+    if (publishedForegroundGroup) {
+        io.clearForegroundProcessGroup();
+    }
+
+    if (waitResult == -1) {
+        io.err() << "terminator: waitpid: "
+                 << std::strerror(errno) << '\n';
+        return 1;
+    }
+
+    if (WIFSTOPPED(status)) {
+        if (processStopped != nullptr) {
+            *processStopped = true;
+        }
+        return 128 + WSTOPSIG(status);
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 1;
+}
+
 } // namespace
 
 int CommandExecutor::execute(
@@ -77,7 +349,8 @@ int CommandExecutor::execute(
     pid_t* startedProcessGroup,
     bool* processStopped,
     const RedirectionSpec* redirection,
-    bool inheritProcessGroup
+    bool inheritProcessGroup,
+    ShellIO* io
 ) const {
 
     if (startedProcess != nullptr) {
@@ -94,6 +367,21 @@ int CommandExecutor::execute(
 
     if (arguments.empty()) {
         return 0;
+    }
+
+    // Thread mode uses posix_spawn so no C++ child-side work is
+    // performed after fork() in the multithreaded GUI process.
+    if (io != nullptr) {
+        return executeWithShellIO(
+            arguments,
+            background,
+            startedProcess,
+            startedProcessGroup,
+            processStopped,
+            redirection,
+            inheritProcessGroup,
+            *io
+        );
     }
 
     // execvp() expects a null-terminated argv array.

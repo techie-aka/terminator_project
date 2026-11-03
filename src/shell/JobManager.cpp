@@ -1,16 +1,47 @@
 
 #include "shell/JobManager.h"
+
+#include "shell/ShellIO.h"
 #include "shell/SignalControl.h"
 
 #include <cerrno>
 #include <csignal>
+#include <chrono>
 #include <ostream>
+#include <thread>
 
 #include <sys/wait.h>
 #include <unistd.h>
 
+namespace {
+
+bool processGroupExists(pid_t processGroupId) {
+    if (processGroupId <= 0) {
+        return false;
+    }
+
+    if (kill(-processGroupId, 0) == 0) {
+        return true;
+    }
+
+    return errno == EPERM;
+}
+
+
+void sendToProcessGroup(pid_t processGroupId, int signal) {
+    if (processGroupId > 0) {
+        (void)kill(-processGroupId, signal);
+    }
+}
+
+} // namespace
+
 JobManager::JobManager()
     : nextJobId(1) {
+}
+
+JobManager::~JobManager() {
+    terminateRemainingJobs();
 }
 
 Job* JobManager::findJob(int id) {
@@ -64,21 +95,21 @@ int JobManager::latestJobId() const {
 }
 
 void JobManager::update() {
-    int status = 0;
+    for (Job& job : jobs) {
+        if (job.state == JobState::Done || job.processId <= 0) {
+            continue;
+        }
 
-    while (true) {
-        const pid_t result = waitpid(
-            -1,
-            &status,
-            WNOHANG | WUNTRACED | WCONTINUED
-        );
+        while (true) {
+            int status = 0;
 
-        if (result > 0) {
-            for (Job& job : jobs) {
-                if (job.processId != result) {
-                    continue;
-                }
+            const pid_t result = waitpid(
+                job.processId,
+                &status,
+                WNOHANG | WUNTRACED | WCONTINUED
+            );
 
+            if (result == job.processId) {
                 if (WIFEXITED(status)) {
                     job.state = JobState::Done;
                     job.exitStatus = WEXITSTATUS(status);
@@ -91,17 +122,27 @@ void JobManager::update() {
                     job.state = JobState::Running;
                 }
 
-                break;
+                if (job.state == JobState::Done) {
+                    break;
+                }
+
+                // Check for any additional status changes.
+                continue;
             }
 
-            continue;
-        }
+            if (result == -1 && errno == EINTR) {
+                continue;
+            }
 
-        if (result == -1 && errno == EINTR) {
-            continue;
-        }
+            if (result == -1 && errno == ECHILD) {
+                // The process is no longer a waitable child.
+                // Its actual exit status is unavailable.
+                job.state = JobState::Done;
+                job.exitStatus = -1;
+            }
 
-        break;
+            break;
+        }
     }
 }
 
@@ -119,7 +160,11 @@ void JobManager::print(std::ostream& output) const {
                 break;
 
             case JobState::Done:
-                output << "Done (" << job.exitStatus << ')';
+                if (job.exitStatus == -1) {
+                    output << "Done (status unavailable)";
+                } else {
+                    output << "Done (" << job.exitStatus << ')';
+                }
                 break;
         }
 
@@ -127,10 +172,14 @@ void JobManager::print(std::ostream& output) const {
     }
 }
 
-bool JobManager::foreground(int id, int& exitStatus) {
+bool JobManager::foreground(
+    int id,
+    int& exitStatus,
+    ShellIO* io
+) {
     update();
 
-    // ID 0 means use the most recent non-completed job.
+    // ID 0 means the latest available job.
     if (id == 0) {
         id = latestJobId();
     }
@@ -141,21 +190,27 @@ bool JobManager::foreground(int id, int& exitStatus) {
         return false;
     }
 
-    /*
-     * The selected job becomes the foreground signal target.
-     *
-     * This is required because Ctrl+C and Ctrl+Z are delivered through
-     * the shell's SIGUSR1/SIGUSR2 notification handlers.
-     */
-    SignalControl::setForegroundProcessGroup(
-        job->processGroupId
-    );
+    // Publish the foreground job to the correct signal handler.
+    //
+    // Thread mode:
+    //     The current tab owns the ShellIO object.
+    //
+    // Process mode:
+    //     The shell uses process-global SignalControl.
+    if (io != nullptr) {
+        io->setForegroundProcessGroup(job->processGroupId);
+    } else {
+        SignalControl::setForegroundProcessGroup(
+            job->processGroupId
+        );
+    }
 
     const pid_t shellProcessGroup = getpgrp();
+
     bool terminalHandedOver = false;
 
-    // Give the job terminal ownership before resuming or waiting for it.
-    if (isatty(STDIN_FILENO)) {
+    // Only process mode has a real terminal attached to stdin.
+    if (io == nullptr && isatty(STDIN_FILENO)) {
         if (tcsetpgrp(
                 STDIN_FILENO,
                 job->processGroupId
@@ -168,7 +223,7 @@ bool JobManager::foreground(int id, int& exitStatus) {
         terminalHandedOver = true;
     }
 
-    // A stopped job must be resumed before waiting for it.
+    // Resume the job if it was previously stopped by Ctrl+Z.
     if (job->state == JobState::Stopped) {
         if (kill(-job->processGroupId, SIGCONT) == -1) {
 
@@ -179,7 +234,11 @@ bool JobManager::foreground(int id, int& exitStatus) {
                 );
             }
 
-            SignalControl::clearForegroundProcessGroup();
+            if (io != nullptr) {
+                io->clearForegroundProcessGroup();
+            } else {
+                SignalControl::clearForegroundProcessGroup();
+            }
 
             update();
             return false;
@@ -191,12 +250,7 @@ bool JobManager::foreground(int id, int& exitStatus) {
     int status = 0;
     pid_t result;
 
-    /*
-     * Wait for the job's representative process.
-     *
-     * WUNTRACED is important: it allows Ctrl+Z to return control
-     * to the shell when the foreground job is suspended.
-     */
+    // Wait until the process exits or gets stopped again.
     do {
         result = waitpid(
             job->processId,
@@ -205,42 +259,41 @@ bool JobManager::foreground(int id, int& exitStatus) {
         );
     } while (result == -1 && errno == EINTR);
 
-    // Restore terminal ownership to the shell.
-    bool terminalRestoreFailed = false;
-
+    // Return terminal ownership to the shell in process mode.
     if (terminalHandedOver) {
-        if (tcsetpgrp(
-                STDIN_FILENO,
-                shellProcessGroup
-            ) == -1) {
-
-            terminalRestoreFailed = true;
-        }
+        (void)tcsetpgrp(
+            STDIN_FILENO,
+            shellProcessGroup
+        );
     }
 
-    // The foreground job has returned control to the shell.
-    SignalControl::clearForegroundProcessGroup();
+    // Clear the foreground target.
+    if (io != nullptr) {
+        io->clearForegroundProcessGroup();
+    } else {
+        SignalControl::clearForegroundProcessGroup();
+    }
 
     if (result == -1) {
         return false;
     }
 
-    // Update the tracked job according to the final wait status.
     if (WIFEXITED(status)) {
         job->state = JobState::Done;
         job->exitStatus = WEXITSTATUS(status);
+
         exitStatus = job->exitStatus;
+
     } else if (WIFSIGNALED(status)) {
         job->state = JobState::Done;
         job->exitStatus = 128 + WTERMSIG(status);
+
         exitStatus = job->exitStatus;
+
     } else if (WIFSTOPPED(status)) {
         job->state = JobState::Stopped;
-        exitStatus = 128 + WSTOPSIG(status);
-    }
 
-    if (terminalRestoreFailed) {
-        return false;
+        exitStatus = 128 + WSTOPSIG(status);
     }
 
     return true;
@@ -269,4 +322,104 @@ bool JobManager::background(int id) {
     }
 
     return true;
+}
+
+void JobManager::terminateRemainingJobs() {
+    update();
+
+    std::vector<pid_t> processGroups;
+    processGroups.reserve(jobs.size());
+
+    // Collect all process groups that still have running processes.
+    for (const Job& job : jobs) {
+        if (job.processGroupId > 0 &&
+            processGroupExists(job.processGroupId)) {
+
+            processGroups.push_back(job.processGroupId);
+        }
+    }
+
+    if (processGroups.empty()) {
+        return;
+    }
+
+    // First request graceful termination.
+    //
+    // SIGHUP tells jobs that the shell is exiting.
+    // SIGCONT allows stopped jobs to receive that signal.
+    for (pid_t group : processGroups) {
+        sendToProcessGroup(group, SIGHUP);
+        sendToProcessGroup(group, SIGCONT);
+    }
+
+    // Wait briefly for jobs to exit.
+    const auto waitForGroups = [&](int milliseconds) {
+        const int attempts = milliseconds / 10;
+
+        for (int attempt = 0; attempt < attempts; ++attempt) {
+            bool anyAlive = false;
+
+            for (pid_t group : processGroups) {
+                if (processGroupExists(group)) {
+                    anyAlive = true;
+                    break;
+                }
+            }
+
+            if (!anyAlive) {
+                return;
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(10)
+            );
+        }
+    };
+
+    waitForGroups(200);
+
+    // Escalate to SIGTERM for processes that ignored SIGHUP.
+    for (pid_t group : processGroups) {
+        sendToProcessGroup(group, SIGTERM);
+    }
+
+    waitForGroups(150);
+
+    // Final escalation.
+    for (pid_t group : processGroups) {
+        sendToProcessGroup(group, SIGKILL);
+    }
+
+    // Reap direct child processes so they do not become zombies.
+    for (Job& job : jobs) {
+        if (job.processId <= 0) {
+            continue;
+        }
+
+        int status = 0;
+        pid_t result;
+
+        do {
+            result = waitpid(
+                job.processId,
+                &status,
+                0
+            );
+        } while (result == -1 && errno == EINTR);
+
+        if (result == job.processId) {
+
+            if (WIFEXITED(status)) {
+                job.exitStatus = WEXITSTATUS(status);
+
+            } else if (WIFSIGNALED(status)) {
+                job.exitStatus = 128 + WTERMSIG(status);
+            }
+
+            job.state = JobState::Done;
+
+        } else if (result == -1 && errno == ECHILD) {
+            job.state = JobState::Done;
+        }
+    }
 }

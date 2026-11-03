@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+class ShellIO;
+
 enum class JobState {
     Running,
     Stopped,
@@ -30,8 +32,16 @@ private:
     Job* findJob(int id);
     const Job* findJob(int id) const;
 
+    // Terminates and reaps all jobs when the shell exits.
+    void terminateRemainingJobs();
+
 public:
     JobManager();
+    ~JobManager();
+
+    // A JobManager owns child-process bookkeeping and must not be copied.
+    JobManager(const JobManager&) = delete;
+    JobManager& operator=(const JobManager&) = delete;
 
     int addJob(
         pid_t processId,
@@ -45,8 +55,17 @@ public:
     void update();
     void print(std::ostream& output) const;
 
-    bool foreground(int id, int& exitStatus);
+    // Thread mode supplies ShellIO to publish the foreground group
+    // belonging to the current tab.
+    //
+    // Process mode leaves io as nullptr and uses SignalControl.
+    bool foreground(
+        int id,
+        int& exitStatus,
+        ShellIO* io = nullptr
+    );
+
     bool background(int id);
 };
 
-#endif
+#endif // JOBMANAGER_H

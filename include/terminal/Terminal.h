@@ -1,26 +1,29 @@
-
 #ifndef TERMINAL_H
 #define TERMINAL_H
 
-#include "process/PtySession.h"
+#include "terminal/TabSession.h"
 #include "terminal/TerminalBuffer.h"
+
+#include <memory>
 
 class Terminal {
 private:
-    PtySession session;
+    std::unique_ptr<TabSession> session;
     TerminalBuffer buffer;
     int firstVisibleLine;
 
 public:
     Terminal();
 
+    explicit Terminal(std::unique_ptr<TabSession> session);
+
     bool start();
     bool sendInput(const std::string& input);
 
-    // Returns true when shell output requests a new tab.
     bool receiveOutput();
 
-    PtySession& getSession();
+    TabSession& getSession();
+
     const TerminalBuffer& getBuffer() const;
     TerminalBuffer& getBuffer();
 

@@ -6,13 +6,14 @@
 #include <string>
 #include <vector>
 
-// Executes foreground pipelines made up of external commands.
-// Each inner vector contains one command followed by its arguments.
+class ShellIO;
+
 class PipelineExecutor {
 public:
     int executePipeline(
-        const std::vector<ParsedCommand>& commands
+        const std::vector<ParsedCommand>& commands,
+        ShellIO* io = nullptr
     ) const;
 };
 
-#endif // PIPELINE_EXECUTOR_H
+#endif

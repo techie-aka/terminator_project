@@ -1,24 +1,20 @@
 #ifndef COMMANDSUBSTITUTION_H
 #define COMMANDSUBSTITUTION_H
 
-#include <functional>
 #include <string>
 
-// Handles $(...) parsing and output substitution separately from the shell's
-// parser and command executors. The shell supplies a callback for executing
-// the inner command; this class captures the callback's standard output.
+class ShellIO;
+
+// Expands $(...) and backtick substitutions by running each inner command
+// in a separate terminator-shell helper process.
 class CommandSubstitution {
 public:
-    using CommandRunner = std::function<int(const std::string& command)>;
-
-    // Expands $(...) occurrences in input. Nested $(...) works by calling the
-    // supplied runner recursively through the shell's normal executeLine path.
-    // Returns false for malformed syntax or an I/O/capture failure.
     bool expand(
         const std::string& input,
-        const CommandRunner& runCommand,
         std::string& expandedCommand,
-        std::string& errorMessage
+        std::string& errorMessage,
+        int errorFd = 2,
+        ShellIO* owner = nullptr
     ) const;
 };
 

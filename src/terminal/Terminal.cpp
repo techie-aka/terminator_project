@@ -1,22 +1,32 @@
-
 #include "terminal/Terminal.h"
+#include "process/PtySession.h"
 
 #include <algorithm>
+#include <utility>
 
 Terminal::Terminal()
-    : firstVisibleLine(0) {
+    : Terminal(std::make_unique<PtySession>()) {
+}
+
+Terminal::Terminal(std::unique_ptr<TabSession> session)
+    : session(std::move(session)),
+      firstVisibleLine(0) {
 }
 
 bool Terminal::start() {
-    return session.start();
+    return session && session->start();
 }
 
 bool Terminal::sendInput(const std::string& input) {
-    return session.writeInput(input);
+    return session && session->writeInput(input);
 }
 
 bool Terminal::receiveOutput() {
-    const std::string output = session.readOutput();
+    if (!session) {
+        return false;
+    }
+
+    const std::string output = session->readOutput();
 
     if (output.empty()) {
         return false;
@@ -25,8 +35,8 @@ bool Terminal::receiveOutput() {
     return buffer.appendOutput(output);
 }
 
-PtySession& Terminal::getSession() {
-    return session;
+TabSession& Terminal::getSession() {
+    return *session;
 }
 
 const TerminalBuffer& Terminal::getBuffer() const {
@@ -42,9 +52,12 @@ int Terminal::getFirstVisibleLine() const {
 }
 
 void Terminal::setFirstVisibleLine(int line) {
-    const int totalLines = static_cast<int>(buffer.getLines().size());
+    const int totalLines =
+        static_cast<int>(buffer.getLines().size());
 
     firstVisibleLine = std::clamp(
-        line, 0, std::max(0, totalLines - 1)
+        line,
+        0,
+        std::max(0, totalLines - 1)
     );
 }

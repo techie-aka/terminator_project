@@ -5,6 +5,9 @@
 #include "terminal/Terminal.h"
 #include "platform/Clipboard.h"
 
+#include "process/PtySession.h"
+#include "thread/ThreadSession.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -352,7 +355,23 @@ void drawTerminal(X11Window& window,
     window.drawScrollbar(totalLines, visibleLines, firstVisibleLine);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Thread mode is the default.
+    bool useProcess = false;
+
+    if (argc == 2 &&
+        std::string(argv[1]) == "useProcess=True") {
+
+        useProcess = true;
+
+    } else if (argc != 1) {
+
+        std::cerr << "Usage: " << argv[0]
+                  << " [useProcess=True]\n";
+
+        return 2;
+    }
+
     X11Window window(WINDOW_WIDTH, WINDOW_HEIGHT);
 
     if (!window.initialize()) {
@@ -369,19 +388,29 @@ int main() {
 
     // Each tab creates and owns an independent Bash process and buffer.
     auto createTab = [&]() -> bool {
-        auto terminal = make_unique<Terminal>();
+
+        std::unique_ptr<TabSession> session;
+
+        if (useProcess) {
+            session = std::make_unique<PtySession>();
+        } else {
+            session = std::make_unique<ThreadSession>();
+        }
+
+        auto terminal = std::make_unique<Terminal>(
+            std::move(session)
+        );
 
         if (!terminal->start()) {
-            cerr << "Unable to start Bash for the new tab\n";
+            cerr << "Unable to start shell for the new tab\n";
             return false;
         }
 
-        terminals.push_back(move(terminal));
+        terminals.push_back(std::move(terminal));
+
         activeTab = static_cast<int>(terminals.size()) - 1;
 
-        // A selection belongs to the tab where it was made.
         clearSelection(selection, draggingScrollbar);
-
         scrollToBottom(*terminals[activeTab]);
 
         return true;
@@ -739,31 +768,19 @@ int main() {
                         continue;
 
                     case InputAction::Interrupt: {
-                        // Ask the shell to forward SIGINT to its foreground process group.
                         Terminal& terminal = *terminals[activeTab];
 
-                        const pid_t shellPid = terminal.getSession().getPid();
+                        terminal.getSession().sendInterrupt();
 
-                        if (shellPid > 0) {
-                            (void)kill(shellPid, SIGUSR1);
-                        }
-
-                        // Do not send ETX through the PTY.
                         redraw = true;
                         continue;
                     }
 
                     case InputAction::Suspend: {
-                        // Ask the shell to forward SIGTSTP to its foreground process group.
                         Terminal& terminal = *terminals[activeTab];
 
-                        const pid_t shellPid = terminal.getSession().getPid();
+                        terminal.getSession().sendSuspend();
 
-                        if (shellPid > 0) {
-                            (void)kill(shellPid, SIGUSR2);
-                        }
-
-                        // Do not send the Ctrl+Z control byte through the PTY.
                         redraw = true;
                         continue;
                     }

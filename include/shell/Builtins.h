@@ -7,6 +7,7 @@
 
 class History;
 class JobManager;
+class ShellIO;
 
 class Builtins {
 public:
@@ -18,7 +19,8 @@ public:
         bool& shouldExit,
         const LineExecutor& executeLine,
         History& history,
-        JobManager& jobs
+        JobManager& jobs,
+        ShellIO* io = nullptr
     ) const;
 };
 

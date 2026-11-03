@@ -1,27 +1,31 @@
 #ifndef PTYSESSION_H
 #define PTYSESSION_H
 
-#include <string>
-#include <sys/types.h>
+#include "terminal/TabSession.h"
 
-class PtySession {
+class PtySession : public TabSession {
 private:
     int masterFd;
     pid_t processId;
 
 public:
     PtySession();
-    ~PtySession();
+    ~PtySession() override;
 
     PtySession(const PtySession&) = delete;
     PtySession& operator=(const PtySession&) = delete;
 
-    bool start();
-    bool writeInput(const std::string& input);
-    std::string readOutput();
+    bool start() override;
+    bool writeInput(const std::string& input) override;
+    std::string readOutput() override;
 
-    int getFileDescriptor() const;
-    pid_t getPid() const;
+    int getFileDescriptor() const override;
+    pid_t getPid() const override;
+
+    void stop() override;
+
+    void sendInterrupt() override;
+    void sendSuspend() override;
 };
 
 #endif

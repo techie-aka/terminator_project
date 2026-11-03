@@ -3,6 +3,7 @@
 #include "shell/CommandParser.h"
 #include "shell/CommandExecutor.h"
 #include "shell/PipelineExecutor.h"
+#include "shell/SignalControl.h"
 
 #include <algorithm>
 #include <array>
@@ -59,9 +60,18 @@ struct MonitorState {
 };
 
 volatile sig_atomic_t interruptRequested = 0;
+volatile sig_atomic_t terminationSignal = 0;
 
-extern "C" void handleMultiWatchInterrupt(int) {
+
+extern "C" void handleMultiWatchInterrupt(int signal) {
     interruptRequested = 1;
+
+    if (signal == SIGTERM || signal == SIGHUP) {
+        terminationSignal = signal;
+
+        // Tell the shell that the current command must terminate.
+        SignalControl::requestShutdown();
+    }
 }
 
 bool writeAll(int fd, const void* data, std::size_t length) {
@@ -110,6 +120,7 @@ void setDefaultCommandSignals() {
     std::signal(SIGTTIN, SIG_DFL);
     std::signal(SIGTTOU, SIG_DFL);
     std::signal(SIGTERM, SIG_DFL);
+    std::signal(SIGHUP, SIG_DFL);
 }
 
 int runOneCommand(
@@ -681,21 +692,69 @@ int MultiWatch::execute(
     }
 
     struct sigaction action{};
-    struct sigaction previousAction{};
+
+    struct sigaction previousActions[3]{};
+
+    const int handledSignals[] = {
+        SIGINT,
+        SIGTERM,
+        SIGHUP
+    };
+
+    int installedSignalCount = 0;
 
     action.sa_handler = handleMultiWatchInterrupt;
+
     sigemptyset(&action.sa_mask);
-    action.sa_flags = 0; // Let select() return EINTR on Ctrl+C.
+
+    // Let select() return EINTR when a signal arrives.
+    action.sa_flags = 0;
 
     interruptRequested = 0;
+    terminationSignal = 0;
 
-    if (sigaction(
-            SIGINT,
-            &action,
-            &previousAction) == -1) {
-        std::perror("multiWatch sigaction");
-        return 1;
+
+    // Install each signal handler and preserve its previous handler.
+    for (int signal : handledSignals) {
+
+        if (sigaction(
+                signal,
+                &action,
+                &previousActions[installedSignalCount]
+            ) == -1) {
+
+            std::perror("multiWatch sigaction");
+
+            // Restore handlers already installed.
+            while (installedSignalCount > 0) {
+                --installedSignalCount;
+
+                (void)sigaction(
+                    handledSignals[installedSignalCount],
+                    &previousActions[installedSignalCount],
+                    nullptr
+                );
+            }
+
+            return 1;
+        }
+
+        ++installedSignalCount;
     }
+
+
+    // Restore all previous handlers before returning to the shell.
+    const auto restoreSignalHandlers = [&]() {
+
+        for (int i = 0; i < installedSignalCount; ++i) {
+
+            (void)sigaction(
+                handledSignals[i],
+                &previousActions[i],
+                nullptr
+            );
+        }
+    };
 
     std::vector<MonitorState> monitors;
     monitors.reserve(commands.size());
@@ -770,11 +829,10 @@ int MultiWatch::execute(
             }
         }
 
-        (void)sigaction(
-            SIGINT,
-            &previousAction,
-            nullptr
-        );
+        restoreSignalHandlers();
+
+        interruptRequested = 0;
+        terminationSignal = 0;
 
         return 1;
     }
@@ -882,16 +940,30 @@ int MultiWatch::execute(
         }
     }
 
+    const int receivedSignal = terminationSignal;
+
     const bool wasInterrupted =
         interruptRequested != 0;
 
-    (void)sigaction(
-        SIGINT,
-        &previousAction,
-        nullptr
-    );
+
+    // Restore the original handlers before returning to the shell.
+    restoreSignalHandlers();
 
     interruptRequested = 0;
+    terminationSignal = 0;
 
-    return wasInterrupted ? 130 : (loopFailed ? 1 : 0);
+
+    if (receivedSignal == SIGTERM) {
+        return 128 + SIGTERM;
+    }
+
+    if (receivedSignal == SIGHUP) {
+        return 128 + SIGHUP;
+    }
+
+    if (wasInterrupted) {
+        return 128 + SIGINT;
+    }
+
+    return loopFailed ? 1 : 0;
 }

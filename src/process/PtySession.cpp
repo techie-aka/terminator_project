@@ -129,46 +129,94 @@ pid_t PtySession::getPid() const {
 }
 
 PtySession::~PtySession() {
+    stop();
+}
+
+void PtySession::stop() {
+
     if (processId > 0) {
-        // Ask the shell and its process group to terminate first.
-        kill(-processId, SIGHUP);
+
+        // First ask the shell to shut down gracefully.
+        //
+        // SignalControl forwards SIGHUP to its active foreground job.
+        // The shell then exits and JobManager cleans up background jobs.
+        (void)kill(-processId, SIGHUP);
+
 
         int status = 0;
         bool exited = false;
 
-        // Give the shell a short opportunity to exit cleanly.
-        for (int attempt = 0; attempt < 20; ++attempt) {
-            const pid_t result = waitpid(processId, &status, WNOHANG);
 
-            if (result == processId ||
-                (result == -1 && errno == ECHILD)) {
-                exited = true;
-                break;
+        // Give the shell a short amount of time to finish.
+        const auto waitBriefly = [&](int attempts) {
+
+            for (int attempt = 0; attempt < attempts; ++attempt) {
+
+                const pid_t result = waitpid(
+                    processId,
+                    &status,
+                    WNOHANG
+                );
+
+                if (result == processId ||
+                    (result == -1 && errno == ECHILD)) {
+
+                    return true;
+                }
+
+                if (result == -1 && errno != EINTR) {
+                    return true;
+                }
+
+                usleep(10000);
             }
 
-            usleep(10000);
+            return false;
+        };
+
+
+        // First wait for graceful shutdown.
+        exited = waitBriefly(100);
+
+
+        // If necessary, escalate to SIGTERM.
+        if (!exited) {
+            (void)kill(-processId, SIGTERM);
+
+            exited = waitBriefly(30);
         }
 
+
+        // Last resort: terminate the shell process group.
         if (!exited) {
-            kill(-processId, SIGTERM);
-            usleep(50000);
+            (void)kill(-processId, SIGKILL);
+        }
 
-            const pid_t result = waitpid(processId, &status, WNOHANG);
 
-            if (result == 0) {
-                kill(-processId, SIGKILL);
-            }
-
-            while (waitpid(processId, &status, 0) == -1 &&
-                   errno == EINTR) {
-            }
+        // Reap the shell process.
+        while (waitpid(processId, &status, 0) == -1 &&
+               errno == EINTR) {
         }
 
         processId = -1;
     }
 
+
+    // Close the PTY master descriptor.
     if (masterFd != -1) {
         close(masterFd);
         masterFd = -1;
+    }
+}
+
+void PtySession::sendInterrupt() {
+    if (processId > 0) {
+        (void)kill(processId, SIGUSR1);
+    }
+}
+
+void PtySession::sendSuspend() {
+    if (processId > 0) {
+        (void)kill(processId, SIGUSR2);
     }
 }

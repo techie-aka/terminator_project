@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+class ShellIO;
+
 class CommandExecutor {
 public:
     int execute(
@@ -16,7 +18,8 @@ public:
         pid_t* startedProcessGroup = nullptr,
         bool* processStopped = nullptr,
         const RedirectionSpec* redirection = nullptr,
-        bool inheritProcessGroup = false
+        bool inheritProcessGroup = false,
+        ShellIO* io = nullptr
     ) const;
 };
 

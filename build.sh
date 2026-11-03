@@ -16,9 +16,9 @@ echo "Building Terminator GUI..."
 
 g++ -std=c++17 -Wall -Wextra \
     -Iinclude \
-    $(find src -name '*.cpp' ! -path 'src/shell/*' -print) \
+    $(find src -name '*.cpp' ! -path 'src/shell/main.cpp' -print) \
     -o build/terminator \
-    -lX11 -lutil
+    -lX11 -lutil -pthread -lrt
 
 echo "Build successful. Launching Terminator..."
-exec ./build/terminator
+exec ./build/terminator "$@"

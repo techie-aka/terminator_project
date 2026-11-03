@@ -1,6 +1,7 @@
 #include "shell/Builtins.h"
 #include "shell/History.h"
 #include "shell/JobManager.h"
+#include "shell/ShellIO.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -20,24 +21,28 @@ bool Builtins::execute(
     bool& shouldExit,
     const LineExecutor& executeLine,
     History& history,
-    JobManager& jobs
+    JobManager& jobs,
+    ShellIO* io
 ) const {
     if (arguments.empty()) {
         return false;
     }
+
+    std::ostream& output = io ? io->out() : std::cout;
+    std::ostream& error = io ? io->err() : std::cerr;
 
     const std::string& command = arguments[0];
 
     // Display the current shell's background jobs.
     if (command == "jobs") {
         if (arguments.size() != 1) {
-            std::cerr << "terminator: jobs: this command takes no arguments\n";
+            error << "terminator: jobs: this command takes no arguments\n";
             exitStatus = 2;
             return true;
         }
 
         jobs.update();
-        jobs.print(std::cout);
+        jobs.print(output);
 
         exitStatus = 0;
         return true;
@@ -46,7 +51,7 @@ bool Builtins::execute(
     // Resume or foreground a tracked job.
     if (command == "fg" || command == "bg") {
         if (arguments.size() > 2) {
-            std::cerr << "terminator: " << command
+            error << "terminator: " << command
                     << ": expected at most one job ID\n";
             exitStatus = 2;
             return true;
@@ -75,7 +80,7 @@ bool Builtins::execute(
 
                 jobId = static_cast<int>(parsedId);
             } catch (const std::exception&) {
-                std::cerr << "terminator: " << command
+                error << "terminator: " << command
                         << ": invalid job ID\n";
                 exitStatus = 2;
                 return true;
@@ -85,15 +90,15 @@ bool Builtins::execute(
         }
 
         if (jobId == 0) {
-            std::cerr << "terminator: " << command
+            error << "terminator: " << command
                     << ": no current job\n";
             exitStatus = 1;
             return true;
         }
 
         if (command == "fg") {
-            if (!jobs.foreground(jobId, exitStatus)) {
-                std::cerr << "terminator: fg: "
+            if (!jobs.foreground(jobId, exitStatus, io)) {
+                error << "terminator: fg: "
                         << "cannot foreground job %" << jobId << '\n';
                 exitStatus = 1;
             }
@@ -102,14 +107,14 @@ bool Builtins::execute(
         }
 
         if (!jobs.background(jobId)) {
-            std::cerr << "terminator: bg: "
+            error << "terminator: bg: "
                     << "cannot resume job %" << jobId << '\n';
             exitStatus = 1;
             return true;
         }
 
         jobs.update();
-        std::cout << '[' << jobId << "] Running\n";
+        output << '[' << jobId << "] Running\n";
         exitStatus = 0;
         return true;
     }
@@ -123,14 +128,14 @@ bool Builtins::execute(
     // Display the history shared by all shell processes.
     if (command == "history") {
         if (arguments.size() != 1) {
-            std::cerr << "terminator: history: "
+            error << "terminator: history: "
                       << "this command takes no arguments\n";
             exitStatus = 2;
             return true;
         }
 
-        if (!history.print(std::cout)) {
-            std::cerr << "terminator: history: "
+        if (!history.print(output)) {
+            error << "terminator: history: "
                       << "shared history is unavailable\n";
             exitStatus = 1;
             return true;
@@ -143,7 +148,7 @@ bool Builtins::execute(
     // Execute commands from a file in the current shell.
     if (command == "source") {
         if (arguments.size() != 2) {
-            std::cerr << "terminator: source: usage: source filename\n";
+            error << "terminator: source: usage: source filename\n";
             exitStatus = 2;
             return true;
         }
@@ -156,7 +161,7 @@ bool Builtins::execute(
             const char* homeDirectory = std::getenv("HOME");
 
             if (homeDirectory == nullptr) {
-                std::cerr << "terminator: source: HOME not set\n";
+                error << "terminator: source: HOME not set\n";
                 exitStatus = 1;
                 return true;
             }
@@ -172,7 +177,7 @@ bool Builtins::execute(
         std::ifstream script(filePath);
 
         if (!script.is_open()) {
-            std::cerr << "terminator: source: "
+            error << "terminator: source: "
                       << filePath << ": cannot open file\n";
             exitStatus = 1;
             return true;
@@ -201,7 +206,7 @@ bool Builtins::execute(
         }
 
         if (script.bad()) {
-            std::cerr << "terminator: source: "
+            error << "terminator: source: "
                       << filePath << ": error reading file\n";
             exitStatus = 1;
         } else {
@@ -218,7 +223,7 @@ bool Builtins::execute(
 
     // cd accepts zero or one directory argument.
     if (arguments.size() > 2) {
-        std::cerr << "terminator: cd: too many arguments\n";
+        error << "terminator: cd: too many arguments\n";
         exitStatus = 1;
         return true;
     }
@@ -228,7 +233,7 @@ bool Builtins::execute(
 
     if (arguments.size() == 1 || arguments[1] == "~") {
         if (homeDirectory == nullptr) {
-            std::cerr << "terminator: cd: HOME not set\n";
+            error << "terminator: cd: HOME not set\n";
             exitStatus = 1;
             return true;
         }
@@ -239,7 +244,7 @@ bool Builtins::execute(
 
         if (targetDirectory.rfind("~/", 0) == 0) {
             if (homeDirectory == nullptr) {
-                std::cerr << "terminator: cd: HOME not set\n";
+                error << "terminator: cd: HOME not set\n";
                 exitStatus = 1;
                 return true;
             }
@@ -251,7 +256,7 @@ bool Builtins::execute(
 
     // chdir() must run in the shell process.
     if (chdir(targetDirectory.c_str()) == -1) {
-        std::cerr << "terminator: cd: "
+        error << "terminator: cd: "
                   << targetDirectory << ": "
                   << std::strerror(errno) << '\n';
 
