@@ -7,6 +7,7 @@
 TerminalBuffer::TerminalBuffer()
     : lines(1, ""),
       cursorColumn(0),
+      cursorRow(0),
       parseState(ParseState::Normal) {
 }
 
@@ -38,25 +39,63 @@ bool TerminalBuffer::appendOutput(const std::string& output) {
             case ParseState::CSI:
                 if (character >= 0x40 && character <= 0x7e) {
                     // Handle a few common terminal control sequences.
-                    if (character == 'J' &&
-                        (controlSequence == "2" || controlSequence == "3")) {
+                    if (character == 'J') {
+
+                    if (controlSequence == "2" ||
+                        controlSequence == "3") {
+
                         clear();
+
+                    } else if (
+                        controlSequence.empty() ||
+                        controlSequence == "0"
+                    ) {
+                        eraseDisplayFromCursor();
+                    }
+
                     } else if (character == 'K') {
+
                         eraseLineFromCursor();
-                    } else if (character == 'G') {
-                        try {
-                            const std::size_t column = controlSequence.empty()
-                                ? 1
-                                : static_cast<std::size_t>(
+
+                    } else if (character == 'A' || character == 'B') {
+
+                        std::size_t amount = 1;
+
+                        if (!controlSequence.empty()) {
+                            try {
+                                amount = std::max<std::size_t>(
+                                    1,
                                     std::stoul(controlSequence)
                                 );
+                            } catch (...) {
+                                amount = 1;
+                            }
+                        }
+
+                        if (character == 'A') {
+                            moveCursorUp(amount);
+                        } else {
+                            moveCursorDown(amount);
+                        }
+
+                    } else if (character == 'G') {
+
+                        try {
+                            const std::size_t column =
+                                controlSequence.empty()
+                                    ? 1
+                                    : static_cast<std::size_t>(
+                                        std::stoul(controlSequence)
+                                    );
 
                             moveCursorToColumn(column > 0 ? column - 1 : 0);
+
                         } catch (...) {
                             moveCursorToColumn(0);
                         }
+
                     } else if (character == 'H' || character == 'f') {
-                        // Full row/column cursor positioning comes later.
+
                         moveCursorToColumn(0);
                     }
 
@@ -107,7 +146,13 @@ void TerminalBuffer::processCharacter(char character) {
     }
 
     if (character == '\n') {
-        lines.emplace_back("");
+
+        ++cursorRow;
+
+        if (cursorRow >= lines.size()) {
+            lines.emplace_back("");
+        }
+
         cursorColumn = 0;
         return;
     }
@@ -134,7 +179,7 @@ void TerminalBuffer::processCharacter(char character) {
         return;
     }
 
-    std::string& line = lines.back();
+    std::string& line = lines[cursorRow];
 
     if (cursorColumn >= line.size()) {
         line.resize(cursorColumn + 1, ' ');
@@ -145,21 +190,66 @@ void TerminalBuffer::processCharacter(char character) {
 }
 
 void TerminalBuffer::eraseLineFromCursor() {
-    std::string& line = lines.back();
+
+    std::string& line = lines[cursorRow];
 
     if (cursorColumn < line.size()) {
         line.resize(cursorColumn);
     }
 }
 
+
+void TerminalBuffer::eraseDisplayFromCursor() {
+
+    eraseLineFromCursor();
+
+    // Remove every row following the current cursor row.
+    if (cursorRow + 1 < lines.size()) {
+
+        lines.erase(
+            lines.begin() +
+                static_cast<std::ptrdiff_t>(cursorRow + 1),
+            lines.end()
+        );
+    }
+}
+
+
 void TerminalBuffer::moveCursorToColumn(std::size_t column) {
+
     cursorColumn = column;
 
-    std::string& line = lines.back();
+    std::string& line = lines[cursorRow];
 
     if (cursorColumn > line.size()) {
         line.resize(cursorColumn, ' ');
     }
+}
+
+void TerminalBuffer::moveCursorUp(std::size_t rows) {
+
+    cursorRow = rows > cursorRow
+        ? 0
+        : cursorRow - rows;
+
+    cursorColumn = std::min(
+        cursorColumn,
+        lines[cursorRow].size()
+    );
+}
+
+
+void TerminalBuffer::moveCursorDown(std::size_t rows) {
+
+    cursorRow = std::min(
+        cursorRow + rows,
+        lines.size() - 1
+    );
+
+    cursorColumn = std::min(
+        cursorColumn,
+        lines[cursorRow].size()
+    );
 }
 
 const std::vector<std::string>& TerminalBuffer::getLines() const {
@@ -174,4 +264,5 @@ void TerminalBuffer::clear() {
     lines.clear();
     lines.emplace_back("");
     cursorColumn = 0;
+    cursorRow = 0;
 }

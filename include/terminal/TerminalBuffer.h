@@ -10,6 +10,7 @@ class TerminalBuffer {
 private:
     std::vector<std::string> lines;
     std::size_t cursorColumn;
+    std::size_t cursorRow;
 
     enum class ParseState {
         Normal,
@@ -23,8 +24,13 @@ private:
     std::string controlSequence;
 
     void processCharacter(char character);
+
     void eraseLineFromCursor();
+    void eraseDisplayFromCursor();
+
     void moveCursorToColumn(std::size_t column);
+    void moveCursorUp(std::size_t rows);
+    void moveCursorDown(std::size_t rows);
 
 public:
     TerminalBuffer();

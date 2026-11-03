@@ -39,6 +39,8 @@ struct TextSelection {
 // State used while dragging the scrollbar thumb.
 bool draggingScrollbar = false;
 int dragOffsetY = 0;
+int selectionMouseX = 0;
+int selectionMouseY = 0;
 
 // Compare positions in terminal reading order.
 bool isPositionBefore(
@@ -372,7 +374,8 @@ void drawVisualText(
     int baseline
 ) {
     const std::string visibleText = logicalText.substr(
-        row.startColumn, row.endColumn - row.startColumn
+        row.startColumn,
+        row.endColumn - row.startColumn
     );
 
     if (row.continuation) {
@@ -385,32 +388,49 @@ void drawVisualText(
     }
 
     if (row.startColumn == 0) {
-        const std::string prompts[] = {
-            "user@terminator> ",
-            "continuation> "
-        };
 
-        for (const std::string& prompt : prompts) {
-            if (logicalText.rfind(prompt, 0) == 0) {
-                const std::size_t promptLength = min(
-                    prompt.size(), visibleText.size()
-                );
+        std::size_t promptLength = 0;
 
-                window.drawText(
-                    visibleText.substr(0, promptLength),
-                    x,
-                    baseline,
-                    TextStyle::Prompt
-                );
+        // The primary prompt now contains the current directory.
+        if (logicalText.rfind("user@terminator:", 0) == 0) {
 
-                window.drawText(
-                    visibleText.substr(promptLength),
-                    x + window.getTextWidth(visibleText.substr(0, promptLength)),
-                    baseline,
-                    TextStyle::Normal
-                );
-                return;
+            const std::size_t promptEnd =
+                logicalText.find("> ");
+
+            if (promptEnd != std::string::npos) {
+                promptLength = promptEnd + 2;
             }
+        }
+
+        // Continuation prompt.
+        else if (logicalText.rfind("> ", 0) == 0) {
+            promptLength = 2;
+        }
+
+        if (promptLength > 0) {
+
+            promptLength = min(
+                promptLength,
+                visibleText.size()
+            );
+
+            window.drawText(
+                visibleText.substr(0, promptLength),
+                x,
+                baseline,
+                TextStyle::Prompt
+            );
+
+            window.drawText(
+                visibleText.substr(promptLength),
+                x + window.getTextWidth(
+                    visibleText.substr(0, promptLength)
+                ),
+                baseline,
+                TextStyle::Normal
+            );
+
+            return;
         }
     }
 
@@ -638,6 +658,7 @@ int main(int argc, char* argv[]) {
     XEvent event;
 
     auto lastBlink = chrono::steady_clock::now();
+    auto lastSelectionScroll = chrono::steady_clock::now();
 
     while (true) {
         // Monitor X11 and every terminal's PTY without blocking the interface.
@@ -672,6 +693,12 @@ int main(int argc, char* argv[]) {
             timeout.tv_sec = 0;
             timeout.tv_usec = 0;
         }
+        else if (selection.dragging) {
+
+            // Check the selection edge every 80 milliseconds.
+            timeout.tv_sec = 0;
+            timeout.tv_usec = 80000;
+        }
 
         const int ready = select(
             maxFd + 1, &readSet, nullptr, nullptr, &timeout
@@ -689,9 +716,16 @@ int main(int argc, char* argv[]) {
         bool redraw = false;
 
         if (ready == 0 && XPending(display) == 0) {
-            cursorVisible = !cursorVisible;
-            lastBlink = chrono::steady_clock::now();
-            redraw = true;
+
+            const auto blinkNow = chrono::steady_clock::now();
+
+            if (blinkNow - lastBlink >=
+                chrono::milliseconds(CURSOR_BLINK_INTERVAL_MS)) {
+
+                cursorVisible = !cursorVisible;
+                lastBlink = blinkNow;
+                redraw = true;
+            }
         }
 
         while (XPending(display) > 0) {
@@ -703,9 +737,14 @@ int main(int argc, char* argv[]) {
                 std::string pastedText;
 
                 if (clipboard.takePastedText(pastedText)) {
+
                     if (!pastedText.empty() && !terminals.empty()) {
-                        // Send the pasted data to the currently active tab's PTY.
-                        terminals[activeTab]->sendInput(pastedText);
+
+                        // Tell LineEditor that this data is a single clipboard paste.
+                        const std::string bracketedPaste =
+                            "\x1b[200~" + pastedText + "\x1b[201~";
+
+                        terminals[activeTab]->sendInput(bracketedPaste);
 
                         cursorVisible = true;
                         lastBlink = chrono::steady_clock::now();
@@ -834,6 +873,23 @@ int main(int argc, char* argv[]) {
                         selection.dragging = true;
                         draggingScrollbar = false;
 
+                        selectionMouseX = event.xbutton.x;
+                        selectionMouseY = event.xbutton.y;
+
+                        // Continue receiving mouse events even after the pointer
+                        // moves outside the terminal window.
+                        XGrabPointer(
+                            display,
+                            window.getWindow(),
+                            False,
+                            PointerMotionMask | ButtonReleaseMask,
+                            GrabModeAsync,
+                            GrabModeAsync,
+                            None,
+                            None,
+                            CurrentTime
+                        );
+
                         redraw = true;
                     }
                 }
@@ -865,12 +921,16 @@ int main(int argc, char* argv[]) {
                     // Extend the selection only while the left button is held.
                     Terminal& terminal = *terminals[activeTab];
 
+                    selectionMouseX = event.xmotion.x;
+                    selectionMouseY = event.xmotion.y;
+
                     selection.focus = getTextPositionAt(
                         window,
                         terminal,
-                        event.xmotion.x,
-                        event.xmotion.y
+                        selectionMouseX,
+                        selectionMouseY
                     );
+
                     redraw = true;
                 }
             } else if (event.type == ButtonRelease) {
@@ -878,6 +938,7 @@ int main(int argc, char* argv[]) {
                     // Keep the selected range visible after the drag ends.
                     draggingScrollbar = false;
                     selection.dragging = false;
+                    XUngrabPointer(display, CurrentTime);
                 }
             } else if (event.type == KeyPress) {
 
@@ -997,6 +1058,78 @@ int main(int argc, char* argv[]) {
 
                     redraw = true;
                 }
+            }
+        }
+
+        // Automatically scroll while the user is selecting text near
+        // the top or bottom edge of the terminal.
+        if (selection.dragging) {
+
+            const int contentTop =
+                START_Y - window.getFontAscent();
+
+            const int contentBottom =
+                window.getHeight() - 8;
+
+            const int edgeSize =
+                max(12, LINE_HEIGHT / 2);
+
+            const auto now = chrono::steady_clock::now();
+
+            if (now - lastSelectionScroll >=
+                chrono::milliseconds(80)) {
+
+                Terminal& terminal = *terminals[activeTab];
+
+                const int totalRows = static_cast<int>(
+                    buildVisualRows(
+                        window,
+                        terminal.getBuffer().getLines()
+                    ).size()
+                );
+
+                const int maxFirstRow = max(
+                    0,
+                    totalRows - getVisibleLines(window)
+                );
+
+                int firstRow = terminal.getFirstVisibleLine();
+
+                // Pointer near the top: scroll upwards.
+                if (selectionMouseY < contentTop + edgeSize &&
+                    firstRow > 0) {
+
+                    --firstRow;
+                }
+
+                // Pointer near the bottom: scroll downwards.
+                else if (
+                    selectionMouseY > contentBottom - edgeSize &&
+                    firstRow < maxFirstRow
+                ) {
+                    ++firstRow;
+                }
+
+                if (firstRow != terminal.getFirstVisibleLine()) {
+
+                    terminal.setFirstVisibleLine(firstRow);
+
+                    // Recalculate the selection endpoint after scrolling.
+                    selection.focus = getTextPositionAt(
+                        window,
+                        terminal,
+                        selectionMouseX,
+                        std::clamp(
+                            selectionMouseY,
+                            contentTop,
+                            max(contentTop, contentBottom - 1)
+                        )
+                    );
+
+                    redraw = true;
+                }
+
+                lastSelectionScroll = now;
             }
         }
 

@@ -172,6 +172,22 @@ void JobManager::print(std::ostream& output) const {
     }
 }
 
+bool JobManager::printStoppedJob(
+    int id,
+    std::ostream& output
+) const {
+    const Job* job = findJob(id);
+
+    if (job == nullptr || job->state != JobState::Stopped) {
+        return false;
+    }
+
+    output << '[' << job->id << "] Stopped "
+           << job->command << '\n' << std::flush;
+
+    return true;
+}
+
 bool JobManager::foreground(
     int id,
     int& exitStatus,

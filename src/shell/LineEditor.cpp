@@ -9,6 +9,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cstdlib>
 
 #include <termios.h>
 #include <unistd.h>
@@ -234,6 +235,86 @@ bool readEscapeSequence(int inputFd, std::string& sequence) {
     return false;
 }
 
+// Read clipboard contents until the closing bracketed-paste marker.
+bool readBracketedPaste(
+    int inputFd,
+    std::string& pastedText
+) {
+    const std::string endMarker = "\x1b[201~";
+
+    pastedText.clear();
+
+    while (true) {
+        char character = '\0';
+
+        if (!readByte(inputFd, character)) {
+            return false;
+        }
+
+        pastedText += character;
+
+        if (pastedText.size() >= endMarker.size() &&
+            pastedText.compare(
+                pastedText.size() - endMarker.size(),
+                endMarker.size(),
+                endMarker
+            ) == 0) {
+
+            pastedText.erase(
+                pastedText.size() - endMarker.size()
+            );
+
+            return true;
+        }
+    }
+}
+
+// Convert Windows and classic Mac line endings to '\n'.
+std::string normalizePastedText(
+    const std::string& pastedText
+) {
+    std::string normalized;
+    normalized.reserve(pastedText.size());
+
+    for (std::size_t i = 0; i < pastedText.size(); ++i) {
+
+        if (pastedText[i] == '\r') {
+
+            if (i + 1 < pastedText.size() &&
+                pastedText[i + 1] == '\n') {
+                ++i;
+            }
+
+            normalized += '\n';
+        }
+        else {
+            normalized += pastedText[i];
+        }
+    }
+
+    // Preserve backslashes. The existing multiline scanner
+    // determines their meaning according to the quote context.
+    return normalized;
+}
+
+// Construct the primary prompt using the current directory.
+std::string buildPrimaryPrompt() {
+
+    char currentDirectory[4096];
+
+    if (getcwd(
+            currentDirectory,
+            sizeof(currentDirectory)
+        ) == nullptr) {
+
+        return "user@terminator:? > ";
+    }
+
+    return "user@terminator:" +
+        std::string(currentDirectory) +
+        "> ";
+}
+
 } // namespace
 
 namespace {
@@ -288,11 +369,12 @@ bool readCommandLineFrom(
 
     bool continuing = false;
     bool joinNextLine = false;
+    bool historyRecall = false;
 
     line.clear();
 
-    const std::string primaryPrompt = "user@terminator> ";
-    const std::string continuationPrompt = "continuation> ";
+    const std::string primaryPrompt = buildPrimaryPrompt();
+    const std::string continuationPrompt = "> ";
 
     std::string currentPrompt = primaryPrompt;
 
@@ -304,6 +386,205 @@ bool readCommandLineFrom(
 
         for (std::size_t i = cursorPosition;
              i < physicalLine.size(); ++i) {
+            output << '\b';
+        }
+
+        output << std::flush;
+    };
+
+    std::size_t renderedHistoryRows = 1;
+    bool historyBlockDisplayed = false;
+
+    // Redraw the recalled history entry without appending duplicates.
+    const auto redrawHistoryCommand = [&]() {
+
+        // Move to the first row of the previous recalled command.
+        if (historyBlockDisplayed && renderedHistoryRows > 1) {
+
+            output << "\033["
+                << (renderedHistoryRows - 1)
+                << "A";
+        }
+
+        // Erase the previous command block and rows below it.
+        output << '\r' << "\033[0J";
+
+        std::string completeCommand = logicalCommand;
+
+        if (!completeCommand.empty()) {
+            completeCommand += '\n';
+        }
+
+        completeCommand += physicalLine;
+
+        // Calculate how many logical lines this command occupies.
+        renderedHistoryRows = 1 +
+            static_cast<std::size_t>(
+                std::count(
+                    completeCommand.begin(),
+                    completeCommand.end(),
+                    '\n'
+                )
+            );
+
+        historyBlockDisplayed = true;
+
+        std::size_t lineStart = 0;
+        bool firstLine = true;
+
+        while (true) {
+
+            const std::size_t lineEnd =
+                completeCommand.find('\n', lineStart);
+
+            const std::string prompt = firstLine
+                ? primaryPrompt
+                : continuationPrompt;
+
+            output << prompt;
+
+            if (lineEnd == std::string::npos) {
+
+                output << completeCommand.substr(lineStart);
+                break;
+            }
+
+            output << completeCommand.substr(
+                lineStart,
+                lineEnd - lineStart
+            ) << '\n';
+
+            lineStart = lineEnd + 1;
+            firstLine = false;
+        }
+
+        output << std::flush;
+    };
+
+    // Load one history entry into the multiline editor.
+    const auto loadHistoryEntry = [&](const std::string& entry) {
+
+        const std::size_t lastNewline =
+            entry.rfind('\n');
+
+        if (lastNewline == std::string::npos) {
+
+            logicalCommand.clear();
+            physicalLine = entry;
+
+            currentPrompt = primaryPrompt;
+            continuing = false;
+        }
+        else {
+
+            logicalCommand = entry.substr(0, lastNewline);
+            physicalLine = entry.substr(lastNewline + 1);
+
+            currentPrompt = continuationPrompt;
+            continuing = true;
+        }
+
+        cursorPosition = physicalLine.size();
+
+        historyRecall = true;
+        joinNextLine = false;
+
+        redrawHistoryCommand();
+    };
+
+    // Insert clipboard contents as one logical command.
+    // Pasted newlines must never behave like individual Enter presses.
+    const auto insertPastedText = [&](const std::string& rawText) {
+
+        const std::string pastedText =
+            normalizePastedText(rawText);
+
+        if (pastedText.empty()) {
+            return;
+        }
+
+        const std::string beforeCursor =
+            physicalLine.substr(0, cursorPosition);
+
+        const std::string afterCursor =
+            physicalLine.substr(cursorPosition);
+
+        const std::size_t firstNewline =
+            pastedText.find('\n');
+
+        // Ordinary single-line paste.
+        if (firstNewline == std::string::npos) {
+
+            physicalLine =
+                beforeCursor + pastedText + afterCursor;
+
+            cursorPosition =
+                beforeCursor.size() + pastedText.size();
+
+            historyRecall = false;
+
+            redrawLine();
+            return;
+        }
+
+        // Complete the first currently edited physical line.
+        const std::string firstLine =
+            beforeCursor + pastedText.substr(0, firstNewline);
+
+        output << '\r' << "\033[K"
+            << currentPrompt << firstLine << '\n';
+
+        if (!logicalCommand.empty() && !joinNextLine) {
+            logicalCommand += '\n';
+        }
+
+        logicalCommand += firstLine;
+        joinNextLine = false;
+
+        std::size_t segmentStart = firstNewline + 1;
+
+        // Process all remaining pasted lines.
+        while (true) {
+
+            const std::size_t nextNewline =
+                pastedText.find('\n', segmentStart);
+
+            if (nextNewline == std::string::npos) {
+
+                const std::string finalSegment =
+                    pastedText.substr(segmentStart);
+
+                physicalLine = finalSegment + afterCursor;
+                cursorPosition = finalSegment.size();
+
+                break;
+            }
+
+            const std::string completeSegment =
+                pastedText.substr(
+                    segmentStart,
+                    nextNewline - segmentStart
+                );
+
+            logicalCommand += '\n';
+            logicalCommand += completeSegment;
+
+            output << continuationPrompt
+                << completeSegment << '\n';
+
+            segmentStart = nextNewline + 1;
+        }
+
+        continuing = true;
+        historyRecall = false;
+        currentPrompt = continuationPrompt;
+
+        // Display the final editable line and restore the cursor.
+        output << currentPrompt << physicalLine;
+
+        for (std::size_t i = cursorPosition;
+            i < physicalLine.size();
+            ++i) {
             output << '\b';
         }
 
@@ -444,6 +725,18 @@ bool readCommandLineFrom(
                 continue;
             }
 
+            // Start of a bracketed clipboard paste.
+            if (sequence == "200~") {
+
+                std::string pastedText;
+
+                if (readBracketedPaste(inputFd, pastedText)) {
+                    insertPastedText(pastedText);
+                }
+
+                continue;
+            }
+
             if (sequence == "D") {
                 // Left arrow.
                 if (cursorPosition > 0) {
@@ -472,7 +765,7 @@ bool readCommandLineFrom(
                     physicalLine.erase(cursorPosition, 1);
                     redrawLine();
                 }
-            } else if (!continuing && sequence == "A") {
+            } else if ((!continuing || historyRecall) && sequence == "A") {
                 // Up arrow: browse older history entries.
                 if (historyPosition == entries.size()) {
                     draft = physicalLine;
@@ -484,23 +777,33 @@ bool readCommandLineFrom(
 
                 if (historyPosition > 0) {
                     --historyPosition;
-                    physicalLine = entries[historyPosition];
-                    cursorPosition = physicalLine.size();
-                    redrawLine();
+                    loadHistoryEntry(entries[historyPosition]);
                 }
-            } else if (!continuing && sequence == "B") {
+            } else if ((!continuing || historyRecall) && sequence == "B") {
                 // Down arrow: browse newer history entries.
                 if (historyPosition < entries.size()) {
+
                     ++historyPosition;
 
                     if (historyPosition == entries.size()) {
-                        physicalLine = draft;
-                    } else {
-                        physicalLine = entries[historyPosition];
-                    }
 
-                    cursorPosition = physicalLine.size();
-                    redrawLine();
+                        // Restore the command that was being typed before history browsing.
+                        logicalCommand.clear();
+
+                        physicalLine = draft;
+                        cursorPosition = physicalLine.size();
+
+                        continuing = false;
+                        historyRecall = false;
+                        joinNextLine = false;
+
+                        currentPrompt = primaryPrompt;
+
+                        redrawHistoryCommand();;
+                    }
+                    else {
+                        loadHistoryEntry(entries[historyPosition]);
+                    }
                 }
             }
 
@@ -520,6 +823,8 @@ bool readCommandLineFrom(
             ++cursorPosition;
             redrawLine();
         }
+        historyRecall = false;
+
     }
 
     if (!restoreTerminal()) {

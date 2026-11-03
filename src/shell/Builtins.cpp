@@ -98,9 +98,16 @@ bool Builtins::execute(
 
         if (command == "fg") {
             if (!jobs.foreground(jobId, exitStatus, io)) {
+
                 error << "terminator: fg: "
-                        << "cannot foreground job %" << jobId << '\n';
+                    << "cannot foreground job %" << jobId << '\n';
+
                 exitStatus = 1;
+
+            } else {
+                // Print immediately if Ctrl+Z stopped the foreground job.
+                // No message is printed if the job exits normally.
+                jobs.printStoppedJob(jobId, output);
             }
 
             return true;

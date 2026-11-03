@@ -55,6 +55,9 @@ public:
     void update();
     void print(std::ostream& output) const;
 
+    // Print the stopped-job notification after fg returns.
+    bool printStoppedJob(int id, std::ostream& output) const;
+
     // Thread mode supplies ShellIO to publish the foreground group
     // belonging to the current tab.
     //

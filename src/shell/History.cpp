@@ -14,6 +14,81 @@ namespace {
 constexpr std::uint32_t HISTORY_MAGIC = 0x54485259;
 constexpr std::size_t HISTORY_CAPACITY = 10000;
 constexpr std::size_t MAX_COMMAND_LENGTH = 1024;
+constexpr const char* HISTORY_ENCODING_PREFIX = "@T1@";
+
+// Convert a multiline command into a safe single-line representation.
+std::string encodeHistoryCommand(const std::string& command) {
+    std::string encoded = HISTORY_ENCODING_PREFIX;
+
+    for (char character : command) {
+        if (character == '\\') {
+            encoded += "\\\\";
+        }
+        else if (character == '\n') {
+            encoded += "\\n";
+        }
+        else if (character != '\r') {
+            encoded += character;
+        }
+    }
+
+    return encoded;
+}
+
+// Restore the original multiline command.
+std::string decodeHistoryCommand(const std::string& stored) {
+    const std::string prefix = HISTORY_ENCODING_PREFIX;
+
+    const bool currentFormat =
+        stored.rfind(prefix, 0) == 0;
+
+    const std::size_t start =
+        currentFormat ? prefix.size() : 0;
+
+    std::string decoded;
+
+    for (std::size_t i = start; i < stored.size(); ++i) {
+
+        if (stored[i] != '\\' || i + 1 >= stored.size()) {
+            decoded += stored[i];
+            continue;
+        }
+
+        const char next = stored[i + 1];
+
+        if (next == 'n') {
+            decoded += '\n';
+            ++i;
+        }
+        else if (next == '\\') {
+            decoded += '\\';
+            ++i;
+        }
+        else {
+            decoded += stored[i];
+        }
+    }
+
+    return decoded;
+}
+
+// Display multiline commands compactly in the history listing.
+std::string formatHistoryCommand(const std::string& stored) {
+    const std::string command = decodeHistoryCommand(stored);
+
+    std::string display;
+
+    for (char character : command) {
+        if (character == '\n') {
+            display += "\\n";
+        }
+        else {
+            display += character;
+        }
+    }
+
+    return display;
+}
 }
 
 struct History::SharedHistory {
@@ -149,15 +224,14 @@ bool History::add(const std::string& command) {
         return false;
     }
 
-    // Keep a multiline command as one history entry.
-    std::string storedCommand;
+    // Store the command without losing its multiline structure.
+    const std::string storedCommand =
+        encodeHistoryCommand(command);
 
-    for (char character : command) {
-        if (character == '\n') {
-            storedCommand += "\\n";
-        } else if (character != '\r') {
-            storedCommand += character;
-        }
+    // Do not silently save an incomplete command.
+    if (storedCommand.size() >= MAX_COMMAND_LENGTH) {
+        unlockShared();
+        return false;
     }
 
     char* entry = sharedHistory->entries[sharedHistory->nextIndex];
@@ -194,7 +268,10 @@ bool History::print(std::ostream& output) const {
             (firstIndex + i) % HISTORY_CAPACITY;
 
         output << (i + 1) << "  "
-               << sharedHistory->entries[index] << '\n';
+            << formatHistoryCommand(
+                    sharedHistory->entries[index]
+                )
+            << '\n';
     }
 
     return unlockShared();
@@ -217,7 +294,9 @@ std::vector<std::string> History::getEntries() const {
         const std::size_t index =
             (firstIndex + i) % HISTORY_CAPACITY;
 
-        entries.emplace_back(sharedHistory->entries[index]);
+        entries.emplace_back(
+            decodeHistoryCommand(sharedHistory->entries[index])
+        );
     }
 
     unlockShared();
