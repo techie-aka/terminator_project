@@ -10,6 +10,7 @@ private:
     static volatile sig_atomic_t foregroundIsHelper;
     static volatile sig_atomic_t shellProcessGroup;
     static volatile sig_atomic_t shutdownRequested;
+    static volatile sig_atomic_t inputInterruptRequested;
 
     static void handleSignal(int signal);
 
@@ -24,6 +25,9 @@ public:
     // corresponding signal to its own foreground command.
     static void setForegroundHelperProcessGroup(pid_t processGroupId);
     static void clearForegroundHelperProcessGroup();
+
+    static bool consumeInputInterruptRequest();
+    static void clearInputInterruptRequest();
 
     // Used to stop the shell's input loop during shutdown.
     static void requestShutdown();

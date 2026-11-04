@@ -150,6 +150,10 @@ string Input::translateKeyPress(XKeyEvent& keyEvent) {
         case XK_End:
             return "\x1b[F";
 
+        case XK_Tab:
+        case XK_ISO_Left_Tab:
+            return "\t";
+
         default:
             break;
     }

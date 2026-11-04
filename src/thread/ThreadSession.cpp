@@ -436,13 +436,17 @@ void ThreadSession::sendInterrupt() {
         return;
     }
 
-
     // Otherwise interrupt the active foreground command.
     const pid_t group = foregroundProcessGroup.load();
 
     if (group > 0) {
         (void)kill(-group, SIGINT);
+        return;
     }
+
+    // At the interactive prompt there is no foreground job.
+    // Send Ctrl+C directly to the shell's input pipe.
+    (void)writeInput(std::string(1, '\x03'));
 }
 
 void ThreadSession::sendSuspend() {

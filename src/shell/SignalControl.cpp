@@ -9,6 +9,7 @@ volatile sig_atomic_t SignalControl::foregroundProcessGroup = 0;
 volatile sig_atomic_t SignalControl::foregroundIsHelper = 0;
 volatile sig_atomic_t SignalControl::shellProcessGroup = 0;
 volatile sig_atomic_t SignalControl::shutdownRequested = 0;
+volatile sig_atomic_t SignalControl::inputInterruptRequested = 0;
 
 
 void SignalControl::handleSignal(int signal) {
@@ -46,10 +47,13 @@ void SignalControl::handleSignal(int signal) {
         // Send the signal to the complete foreground process group.
         (void)kill(-targetGroup, targetSignal);
 
-    } else if (targetSignal == SIGINT && shellProcessGroup > 0) {
-        // At an idle prompt, there may be no foreground job.
-        // Forward SIGINT to the shell process group so MultiWatch
-        // can receive Ctrl+C through its own signal handler.
+    }  else if (targetSignal == SIGINT && shellProcessGroup > 0) {
+
+        // No foreground job exists. Notify the line editor that
+        // Ctrl+C should cancel the current interactive input.
+        inputInterruptRequested = 1;
+
+        // Preserve existing MultiWatch Ctrl+C behaviour.
         (void)kill(-shellProcessGroup, SIGINT);
     }
 }
@@ -61,6 +65,7 @@ bool SignalControl::install() {
     foregroundProcessGroup = 0;
     foregroundIsHelper = 0;
     shutdownRequested = 0;
+    inputInterruptRequested = 0;
 
     struct sigaction action {};
 
@@ -128,4 +133,19 @@ void SignalControl::requestShutdown() {
 
 bool SignalControl::isShutdownRequested() {
     return shutdownRequested != 0;
+}
+
+bool SignalControl::consumeInputInterruptRequest() {
+
+    if (inputInterruptRequested == 0) {
+        return false;
+    }
+
+    inputInterruptRequested = 0;
+    return true;
+}
+
+
+void SignalControl::clearInputInterruptRequest() {
+    inputInterruptRequested = 0;
 }
