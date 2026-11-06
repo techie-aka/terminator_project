@@ -41,6 +41,7 @@ bool draggingScrollbar = false;
 int dragOffsetY = 0;
 int selectionMouseX = 0;
 int selectionMouseY = 0;
+bool selectionPointerGrabbed = false;
 
 // Compare positions in terminal reading order.
 bool isPositionBefore(
@@ -107,6 +108,7 @@ struct VisualRow {
 constexpr int CONTENT_LEFT = 16;
 constexpr int CONTENT_RIGHT = 12;
 constexpr int TAB_BAR_HEIGHT = 44;
+constexpr int NEW_TAB_BUTTON_WIDTH = 44;
 const std::string CONTINUATION_MARKER = "> ";
 
 int getVisibleLines(const X11Window& window) {
@@ -218,7 +220,11 @@ void drawTabs(
     }
 
     const int availableWidth = window.getWidth() - window.getScrollbarWidth();
-    const int tabWidth = max(1, availableWidth / tabCount);
+    const int tabWidth = max(
+        1,
+        (availableWidth - NEW_TAB_BUTTON_WIDTH) / tabCount
+    );
+    const int tabsWidth = tabWidth * tabCount;
     const bool showCloseButtons = tabCount > 1;
 
     for (int i = 0; i < tabCount; ++i) {
@@ -234,6 +240,15 @@ void drawTabs(
             showCloseButtons
         );
     }
+
+    // Keep a dedicated button visible at the right end of the tab bar.
+    window.drawTab(
+        tabsWidth,
+        availableWidth - tabsWidth,
+        "+",
+        false,
+        false
+    );
 
     window.drawSeparator(TAB_BAR_HEIGHT);
 }
@@ -756,7 +771,33 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (event.type == ConfigureNotify) {
+            if (event.type == FocusOut) {
+
+                // Never retain a pointer grab after losing application focus.
+                if (selectionPointerGrabbed) {
+
+                    XUngrabPointer(display, CurrentTime);
+                    XFlush(display);
+
+                    selectionPointerGrabbed = false;
+                }
+
+                selection.dragging = false;
+                draggingScrollbar = false;
+
+                continue;
+
+            } else if (event.type == FocusIn) {
+
+                cursorVisible = true;
+                lastBlink = chrono::steady_clock::now();
+
+                redraw = true;
+
+                continue;
+
+            } else if (event.type == ConfigureNotify) {
+
                 window.updateDimensions(
                     event.xconfigure.width,
                     event.xconfigure.height
@@ -801,28 +842,42 @@ int main(int argc, char* argv[]) {
                         event.xbutton.x < availableWidth) {
 
                         const int tabCount = static_cast<int>(terminals.size());
-                        const int tabWidth = max(1, availableWidth / tabCount);
-                        const int clickedTab = event.xbutton.x / tabWidth;
-                        const int positionInTab = event.xbutton.x % tabWidth;
+                        const int tabWidth = max(
+                            1,
+                            (availableWidth - NEW_TAB_BUTTON_WIDTH) / tabCount
+                        );
+                        const int tabsWidth = tabWidth * tabCount;
 
-                        if (clickedTab >= 0 && clickedTab < tabCount) {
-                            // The close icon occupies the rightmost 18 pixels of each tab.
-                            const bool clickedCloseButton =
-                                tabCount > 1 && positionInTab >= tabWidth - 18;
-
-                            if (clickedCloseButton) {
-                                activeTab = clickedTab;
-
-                                if (!closeTab()) {
-                                    return 0;
-                                }
-                            } else {
-                                activeTab = clickedTab;
+                        // The reserved area to the right of the tabs creates a new tab.
+                        if (event.xbutton.x >= tabsWidth) {
+                            if (createTab()) {
+                                cursorVisible = true;
+                                lastBlink = chrono::steady_clock::now();
+                                redraw = true;
                             }
+                        } else {
+                            const int clickedTab = event.xbutton.x / tabWidth;
+                            const int positionInTab = event.xbutton.x % tabWidth;
 
-                            clearSelection(selection, draggingScrollbar);
-                            cursorVisible = true;
-                            redraw = true;
+                            if (clickedTab >= 0 && clickedTab < tabCount) {
+                                // The close icon occupies the rightmost 18 pixels of each tab.
+                                const bool clickedCloseButton =
+                                    tabCount > 1 && positionInTab >= tabWidth - 18;
+
+                                if (clickedCloseButton) {
+                                    activeTab = clickedTab;
+
+                                    if (!closeTab()) {
+                                        return 0;
+                                    }
+                                } else {
+                                    activeTab = clickedTab;
+                                }
+
+                                clearSelection(selection, draggingScrollbar);
+                                cursorVisible = true;
+                                redraw = true;
+                            }
                         }
                     } else if (event.xbutton.x >= barX) {
                         Terminal& terminal = *terminals[activeTab];
@@ -878,7 +933,7 @@ int main(int argc, char* argv[]) {
 
                         // Continue receiving mouse events even after the pointer
                         // moves outside the terminal window.
-                        XGrabPointer(
+                        const int grabStatus = XGrabPointer(
                             display,
                             window.getWindow(),
                             False,
@@ -889,6 +944,8 @@ int main(int argc, char* argv[]) {
                             None,
                             CurrentTime
                         );
+
+                        selectionPointerGrabbed = (grabStatus == GrabSuccess);
 
                         redraw = true;
                     }
@@ -933,12 +990,20 @@ int main(int argc, char* argv[]) {
 
                     redraw = true;
                 }
-            } else if (event.type == ButtonRelease) {
+            }else if (event.type == ButtonRelease) {
+
                 if (event.xbutton.button == Button1) {
-                    // Keep the selected range visible after the drag ends.
+
                     draggingScrollbar = false;
                     selection.dragging = false;
-                    XUngrabPointer(display, CurrentTime);
+
+                    if (selectionPointerGrabbed) {
+
+                        XUngrabPointer(display, CurrentTime);
+                        XFlush(display);
+
+                        selectionPointerGrabbed = false;
+                    }
                 }
             } else if (event.type == KeyPress) {
 

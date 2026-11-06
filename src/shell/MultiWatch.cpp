@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -28,7 +30,7 @@
 namespace {
 
 constexpr std::size_t MAX_FRAME_DATA = 4096;
-constexpr int RESTART_DELAY_SECONDS = 2;
+constexpr int DEFAULT_RESTART_DELAY_SECONDS = 2;
 constexpr int TERMINATION_GRACE_MS = 300;
 constexpr const char* SEPARATOR =
     "----------------------------------------------------";
@@ -62,6 +64,35 @@ struct MonitorState {
 volatile sig_atomic_t interruptRequested = 0;
 volatile sig_atomic_t terminationSignal = 0;
 
+bool parsePositiveIntervalSeconds(
+    const std::string& value,
+    int& intervalSeconds
+) {
+    if (value.empty()) {
+        return false;
+    }
+
+    for (char character : value) {
+        if (character < '0' || character > '9') {
+            return false;
+        }
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+
+    if (errno == ERANGE ||
+        end == value.c_str() ||
+        *end != '\0' ||
+        parsed <= 0 ||
+        parsed > INT_MAX) {
+        return false;
+    }
+
+    intervalSeconds = static_cast<int>(parsed);
+    return true;
+}
 
 extern "C" void handleMultiWatchInterrupt(int signal) {
     interruptRequested = 1;
@@ -237,7 +268,8 @@ bool validateMonitoredCommand(
 void workerLoop(
     const std::string& command,
     int outputFd,
-    int lastExitStatus
+    int lastExitStatus,
+    int intervalSeconds
 ) {
     // This worker is the process-group leader for its entire command tree.
     (void)setpgid(0, 0);
@@ -377,8 +409,8 @@ void workerLoop(
             _exit(0);
         }
 
-        // Start the next invocation two seconds after completion.
-        timespec delay{RESTART_DELAY_SECONDS, 0};
+        // Start the next invocation after the configured delay.
+        timespec delay{intervalSeconds, 0};
 
         while (nanosleep(&delay, &delay) == -1 &&
                errno == EINTR) {}
@@ -542,9 +574,11 @@ bool MultiWatch::isInvocation(const std::string& line) {
 bool MultiWatch::parseInvocation(
     const std::string& line,
     std::vector<std::string>& commands,
+    int& intervalSeconds,
     std::string& errorMessage
 ) {
     commands.clear();
+    intervalSeconds = DEFAULT_RESTART_DELAY_SECONDS;
     errorMessage.clear();
 
     std::size_t position =
@@ -553,7 +587,7 @@ bool MultiWatch::parseInvocation(
     if (position == std::string::npos ||
         line.compare(position, 10, "multiWatch") != 0) {
         errorMessage =
-            "expected multiWatch [\"command 1\", \"command 2\"]";
+            "expected multiWatch [--interval SECONDS] [\"command 1\", ...]";
         return false;
     }
 
@@ -571,9 +605,50 @@ bool MultiWatch::parseInvocation(
 
     skipSpaces();
 
+    // The interval option is optional; the default remains two seconds.
+    // Supported forms: --interval 3, --interval=3, -i 3, and -i=3.
+    if (position < line.size() && line[position] == '-') {
+        const std::size_t optionEnd =
+            line.find_first_of(" \t\r\n", position);
+        const std::size_t end =
+            optionEnd == std::string::npos ? line.size() : optionEnd;
+        const std::string option = line.substr(position, end - position);
+        std::string intervalText;
+
+        if (option == "--interval" || option == "-i") {
+            position = end;
+            skipSpaces();
+
+            const std::size_t valueEnd =
+                line.find_first_of(" \t\r\n", position);
+            const std::size_t valueLimit =
+                valueEnd == std::string::npos ? line.size() : valueEnd;
+
+            intervalText = line.substr(position, valueLimit - position);
+            position = valueLimit;
+        } else if (option.rfind("--interval=", 0) == 0) {
+            intervalText = option.substr(11);
+            position = end;
+        } else if (option.rfind("-i=", 0) == 0) {
+            intervalText = option.substr(3);
+            position = end;
+        } else {
+            errorMessage = "unknown option: " + option;
+            return false;
+        }
+
+        if (!parsePositiveIntervalSeconds(intervalText, intervalSeconds)) {
+            errorMessage =
+                "interval must be a positive whole number of seconds";
+            return false;
+        }
+
+        skipSpaces();
+    }
+
     if (position >= line.size() ||
         line[position] != '[') {
-        errorMessage = "expected '[' after multiWatch";
+        errorMessage = "expected '[' after multiWatch interval option";
         return false;
     }
 
@@ -670,8 +745,15 @@ bool MultiWatch::parseInvocation(
 
 int MultiWatch::execute(
     const std::vector<std::string>& commands,
-    int lastExitStatus
+    int lastExitStatus,
+    int intervalSeconds
 ) const {
+    if (intervalSeconds <= 0) {
+        std::cerr
+            << "multiWatch: interval must be a positive whole number of seconds\n";
+        return 2;
+    }
+
     if (commands.empty()) {
         std::cerr
             << "multiWatch: provide at least one command\n";
@@ -801,7 +883,8 @@ int MultiWatch::execute(
             workerLoop(
                 command,
                 outputPipe[1],
-                lastExitStatus
+                lastExitStatus,
+                intervalSeconds
             );
 
             _exit(0);

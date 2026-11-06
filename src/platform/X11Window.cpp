@@ -165,7 +165,7 @@ bool X11Window::initialize() {
         window,
         ExposureMask | KeyPressMask | ButtonPressMask |
         ButtonReleaseMask | Button1MotionMask | PropertyChangeMask |
-        StructureNotifyMask
+        StructureNotifyMask | FocusChangeMask
     );
 
     GC gc = DefaultGC(display, screen);

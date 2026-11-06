@@ -55,11 +55,13 @@ int ShellEngine::runImpl(ShellIO* io, const std::string* singleCommand) {
         // Its quoted command-list syntax must remain intact.
         if (MultiWatch::isInvocation(commandLine)) {
             std::vector<std::string> monitoredCommands;
+            int intervalSeconds = 0;
             std::string multiWatchError;
 
             if (!MultiWatch::parseInvocation(
                     commandLine,
                     monitoredCommands,
+                    intervalSeconds,
                     multiWatchError)) {
                 error << "terminator: multiWatch: "
                         << multiWatchError << '\n';
@@ -82,7 +84,8 @@ int ShellEngine::runImpl(ShellIO* io, const std::string* singleCommand) {
                 // Process mode already has one shell process per tab.
                 lastExitStatus = multiWatch.execute(
                     monitoredCommands,
-                    lastExitStatus
+                    lastExitStatus,
+                    intervalSeconds
                 );
             }
 
